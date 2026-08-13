@@ -6,11 +6,13 @@ const TERMINAL_NAME = "Jcode";
 const CHAT_VIEW_ID = "jcode.chatView";
 const CHAT_SESSION_KEY = "jcode.chat.sessionId";
 let jcodeTerminal;
+let lastTextEditor;
 
 /**
  * @param {vscode.ExtensionContext} context
  */
 function activate(context) {
+  lastTextEditor = vscode.window.activeTextEditor;
   const chatProvider = new JcodeChatViewProvider(context);
 
   context.subscriptions.push(
@@ -36,6 +38,14 @@ function activate(context) {
       if (terminal === jcodeTerminal) {
         jcodeTerminal = undefined;
       }
+    }),
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (editor) {
+        lastTextEditor = editor;
+      }
+    }),
+    vscode.window.onDidChangeTextEditorSelection((event) => {
+      lastTextEditor = event.textEditor;
     }),
     chatProvider,
   );
@@ -180,7 +190,7 @@ class JcodeChatViewProvider {
     const config = vscode.workspace.getConfiguration("jcode");
     const executable = config.get("executablePath", "jcode");
     const configuredArguments = config.get("launchArguments", []);
-    const cwd = getWorkingDirectory(vscode.window.activeTextEditor);
+    const cwd = getWorkingDirectory(getCurrentTextEditor());
     const sessionId = this.context.workspaceState.get(CHAT_SESSION_KEY);
     const args = [];
 
@@ -275,7 +285,7 @@ class JcodeChatViewProvider {
 }
 
 async function captureSelectionContext(context, warnWhenMissing) {
-  const editor = vscode.window.activeTextEditor;
+  const editor = getCurrentTextEditor();
   if (!editor) {
     if (warnWhenMissing) {
       void vscode.window.showWarningMessage("Open a text editor and select some code first.");
@@ -323,6 +333,19 @@ async function captureSelectionContext(context, warnWhenMissing) {
   };
 }
 
+function getCurrentTextEditor() {
+  const activeEditor = vscode.window.activeTextEditor;
+  if (activeEditor) {
+    lastTextEditor = activeEditor;
+    return activeEditor;
+  }
+
+  if (lastTextEditor && vscode.workspace.textDocuments.includes(lastTextEditor.document)) {
+    return lastTextEditor;
+  }
+  return undefined;
+}
+
 async function writeSelectionContext(context, editor, selectedText) {
   const directory = vscode.Uri.joinPath(context.globalStorageUri, "selections");
   await vscode.workspace.fs.createDirectory(directory);
@@ -349,7 +372,7 @@ async function writeSelectionContext(context, editor, selectedText) {
   return file;
 }
 
-function openJcodeTerminal(editor = vscode.window.activeTextEditor) {
+function openJcodeTerminal(editor = getCurrentTextEditor()) {
   if (jcodeTerminal && !jcodeTerminal.exitStatus) {
     jcodeTerminal.show(false);
     return jcodeTerminal;

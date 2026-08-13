@@ -89,7 +89,7 @@ async function run() {
     new vscode.Selection(1, 6, 1, 10),
   ];
 
-  await vscode.commands.executeCommand("jcode.open");
+  await vscode.commands.executeCommand("jcode.askSelection");
   const firstResult = await vscode.commands.executeCommand(
     "jcode._test.sendChat",
     "Explain the selected identifiers.",
