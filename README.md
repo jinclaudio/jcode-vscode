@@ -1,23 +1,30 @@
 # Jcode for VS Code
 
-This repository contains a dependency-free VS Code extension for Jcode. It adds a
-native Chat view to the Activity Bar, can launch the full Jcode TUI in VS Code's
-integrated terminal, and lets the user explicitly send editor selections to the agent.
+This repository contains a VS Code extension for Jcode. It adds a native Chat view
+to the Activity Bar, can launch the full Jcode TUI in VS Code's integrated terminal,
+and lets the user explicitly send editor selections to the agent.
 
 ## What works
 
 - The Jcode icon in the Activity Bar opens a native sidebar Chat page.
 - `Jcode: Open Chat` focuses the Chat page. `Jcode: Open Terminal Agent` starts the
   full Jcode TUI in the current workspace.
-- The Chat page supports multi-turn sessions, New Chat, cancellation, workspace
-  prompts, and an optional current-selection attachment.
+- The Chat page supports multi-turn sessions, New Chat, cancellation, live streaming
+  replies, workspace prompts, and an optional current-selection attachment.
+- The Chat page has a model picker populated from Jcode's live model catalog and a
+  reasoning-effort selector (`none` … `max`, subject to what the provider accepts).
+  Choices persist per workspace and are applied to the chat session through the
+  Jcode SDK (`listModels` / `setModel` / `setReasoningEffort`), and to the terminal
+  agent through `-m` and the reasoning-effort environment variables.
 - Select code and press `Ctrl+Shift+J` (`Cmd+Shift+J` on macOS) to attach it and focus Chat.
 - The editor context menu includes ask, explain, and fix commands.
 - Multiple selections are supported.
 - Unsaved selected text is supported. The extension writes an exact local snapshot
   under VS Code extension storage and tells Jcode to read it.
-- Sidebar prompts use the stable `jcode run --json` CLI boundary. The returned session
-  ID is retained in workspace state and passed back with `--resume` for later turns.
+- Sidebar prompts run over the Jcode harness API (protocol v1) through the official
+  [`@1jehuang/jcode-sdk`](https://jcode.sh/sdk). The extension connects to the
+  `jcode api-bridge` socket, starting the bridge automatically when it is not
+  already running, and shares the user's live Jcode sessions.
 - Selection content is only shared after an explicit command. It is not captured or
   transmitted continuously.
 
@@ -27,8 +34,8 @@ integrated terminal, and lets the user explicitly send editor selections to the 
 2. Run `jcode` once in a terminal and finish provider authentication.
 3. Open this folder in VS Code and press `F5` to launch an Extension Development Host.
 
-This MVP is plain JavaScript, so it has no compile step or runtime npm dependencies.
-To package it, install Node.js and run:
+The extension has one runtime npm dependency, `@1jehuang/jcode-sdk`. Install it and
+package with:
 
 ```bash
 npm install
@@ -41,7 +48,9 @@ npm run package
 
 - extension activation and command registration;
 - Activity Bar container and Webview view contributions;
-- Chat process invocation, JSON response handling, session resume, and New Chat;
+- chat sessions over the harness API: session creation, multi-turn reuse, New Chat,
+  streaming replies, model and reasoning-effort switching, and cancellation
+  (against a fake bridge that speaks the SDK protocol);
 - active editor and multiple selection capture, including unsaved text;
 - exact selection ranges and temporary context-file contents;
 - Chat and terminal working directories and configured Jcode arguments;
@@ -63,20 +72,35 @@ On Linux CI, the same test can run under Xvfb by invoking VS Code with
 - `jcode.executablePath`: absolute path or command name for Jcode.
 - `jcode.launchArguments`: extra arguments such as `--provider` and a provider name.
 - `jcode.maxSelectionCharacters`: safety limit for selection snapshots.
+- `jcode.defaultModel`: default model applied to new Jcode chat sessions and the
+  terminal agent, e.g. `deepseek-v4-pro`. The sidebar chat model picker overrides
+  this per workspace.
+- `jcode.models`: fallback model names for the sidebar model picker when Jcode's
+  live model catalog is unreachable. When empty, a built-in curated list is used.
+- `jcode.defaultEffort`: default reasoning effort (`none`, `minimal`, `low`,
+  `medium`, `high`, `xhigh`, `max`; the accepted set depends on the provider).
+  Applied to new chat sessions through the SDK's `setReasoningEffort` and passed
+  to the terminal agent through the `JCODE_OPENAI_REASONING_EFFORT` /
+  `JCODE_ANTHROPIC_REASONING_EFFORT` environment variables.
+- `JCODE_API_SOCKET` (environment variable): overrides the harness API socket path
+  the extension connects to and starts the bridge on.
 
 Example `settings.json`:
 
 ```json
 {
   "jcode.executablePath": "/usr/local/bin/jcode",
-  "jcode.launchArguments": ["--provider", "openai"]
+  "jcode.launchArguments": ["--provider", "openai"],
+  "jcode.models": ["deepseek-v4-flash", "deepseek-v4-pro", "claude-opus-4-6"],
+  "jcode.defaultEffort": "medium"
 }
 ```
 
-## Architecture roadmap
+## Architecture
 
-The sidebar currently uses `jcode run --json`, a stable public CLI contract that is
-easy to package and test without runtime dependencies. A later version can move to
-`jcode acp` and `@agentclientprotocol/sdk` for token-by-token streaming, structured
-tool cards, permission prompts, and richer session events. The extension deliberately
-does not parse terminal rendering or couple itself to Jcode's internal daemon protocol.
+The sidebar chats with Jcode over the stable harness API (protocol v1) through the
+official TypeScript SDK. The extension connects to the user's `jcode api-bridge`
+(autostarting it if needed), creates or resumes a per-workspace session, lists the
+real model catalog for the picker, streams `text_delta` events into the Chat page,
+and switches model and reasoning effort with `setModel` / `setReasoningEffort`.
+The terminal agent uses the public `jcode` CLI so it gets a full interactive TUI.

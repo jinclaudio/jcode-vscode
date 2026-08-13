@@ -2,7 +2,7 @@
   "name": "jcode-vscode",
   "displayName": "Jcode",
   "description": "Chat with Jcode in the VS Code sidebar and send the active editor selection as context.",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "publisher": "jcode",
   "license": "MIT",
   "repository": {
@@ -138,6 +138,34 @@
           "default": 200000,
           "minimum": 1000,
           "description": "Maximum number of selected characters that may be sent to Jcode."
+        },
+        "jcode.defaultModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Default model applied to new Jcode chat sessions and the terminal agent, e.g. `deepseek-v4-pro`. When empty, Jcode's own default model is used. The sidebar chat has its own model picker that overrides this."
+        },
+        "jcode.models": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Fallback model names for the sidebar chat model picker when Jcode's live model catalog is unreachable. When empty, a built-in curated list is used. The picker normally lists the real catalog from the connected Jcode daemon (`listModels`)."
+        },
+        "jcode.defaultEffort": {
+          "type": "string",
+          "enum": [
+            "",
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "",
+          "markdownDescription": "Default reasoning effort applied to new Jcode chat sessions (`setReasoningEffort`) and passed to the terminal agent via the `JCODE_OPENAI_REASONING_EFFORT` / `JCODE_ANTHROPIC_REASONING_EFFORT` environment variables. When empty, Jcode's own default is used. Levels: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; the accepted set depends on the provider."
         }
       }
     }
@@ -146,6 +174,9 @@
     "check": "node --check extension.js",
     "test:acceptance": "code --extensionDevelopmentPath=. --extensionTestsPath=./test/acceptance/index.js",
     "package": "npx @vscode/vsce package"
+  },
+  "dependencies": {
+    "@1jehuang/jcode-sdk": "^1.1.0"
   },
   "devDependencies": {
     "@vscode/vsce": "^3.6.0"

@@ -6,6 +6,144 @@ const vscode = require("vscode");
 
 const EXTENSION_ID = "jcode.jcode-vscode";
 
+const FAKE_BRIDGE_PY = String.raw`#!/usr/bin/env python3
+import json, os, socket, sys, threading, time
+
+ARGS_LOG = os.environ.get("FAKE_ARGS_LOG", "")
+BRIDGE_LOG = os.environ.get("FAKE_BRIDGE_LOG", "")
+
+def log_args():
+    if ARGS_LOG:
+        with open(ARGS_LOG, "a") as f:
+            f.write("\0".join(sys.argv[1:]) + "\n")
+
+def log_frame(frame):
+    if BRIDGE_LOG:
+        with open(BRIDGE_LOG, "a") as f:
+            f.write(json.dumps(frame) + "\n")
+
+args = sys.argv[1:]
+if "api-bridge" not in args:
+    log_args()
+    for _line in sys.stdin:
+        pass
+    sys.exit(0)
+
+sock_path = None
+for i, a in enumerate(args):
+    if a == "--api-socket" and i + 1 < len(args):
+        sock_path = args[i + 1]
+if not sock_path:
+    sock_path = os.environ.get("JCODE_API_SOCKET", "/tmp/fake-jcode-api.sock")
+try:
+    os.unlink(sock_path)
+except FileNotFoundError:
+    pass
+
+MODELS = ["test-model-a", "test-model-b", "gpt-5.5", "claude-opus-4-6"]
+state = {"sessions": {}, "next_session": 1, "current": "test-model-a"}
+
+def emit(conn, frame):
+    conn.sendall((json.dumps(frame) + "\n").encode())
+
+def send_message(conn, frame):
+    sid = frame["session_id"]
+    content = frame["content"]
+    emit(conn, {"v": 1, "ev": "message_accepted", "session_id": sid})
+    if "WAIT_FOR_CANCEL" in content:
+        state.setdefault("pending", []).append((conn, sid))
+        return
+    text = "FAKE_CHAT_RESPONSE: " + content[:80]
+    emit(conn, {"v": 1, "ev": "text_delta", "session_id": sid, "text": text})
+    emit(conn, {"v": 1, "ev": "turn_done", "session_id": sid})
+
+def handle(conn, frame):
+    log_frame(frame)
+    req = frame.get("req")
+    rid = frame.get("id")
+    reply = lambda ev, **kw: emit(conn, {"v": 1, "reply_to": rid, "ev": ev, **kw})
+    if req == "hello":
+        reply("hello_ok", version=1, server="fake-jcode-bridge/0.1.0",
+              capabilities=["sessions", "streaming", "runtime_info"])
+    elif req == "create_session":
+        sid = "fake-session-%d" % state["next_session"]
+        state["next_session"] += 1
+        state["sessions"][sid] = {"working_dir": frame.get("working_dir")}
+        reply("attached", session={"session_id": sid, "working_dir": frame.get("working_dir"), "status": "idle"})
+    elif req == "attach_session":
+        sid = frame["session_id"]
+        if sid not in state["sessions"]:
+            reply("error", code="unknown_session", message="no such session")
+        else:
+            reply("attached", session={"session_id": sid, "working_dir": state["sessions"][sid]["working_dir"], "status": "idle"})
+    elif req == "detach_session":
+        reply("ok")
+    elif req == "list_models":
+        reply("models", session_id=frame["session_id"], models=MODELS, current=state["current"])
+    elif req == "get_runtime_info":
+        reply("runtime_info", session_id=frame["session_id"], provider="test-provider",
+              model=state["current"], routes=[])
+    elif req == "set_model":
+        model = frame["model"]
+        if model == "bad-model":
+            reply("error", code="invalid_request", message="unknown model")
+        else:
+            state["current"] = model
+            reply("ok")
+    elif req == "set_reasoning_effort":
+        reply("ok")
+    elif req == "send_message":
+        send_message(conn, frame)
+    elif req == "cancel":
+        reply("ok")
+        sid = frame.get("session_id")
+        pending = state.get("pending", [])
+        state["pending"] = [p for p in pending if p != (conn, sid)]
+        if (conn, sid) in pending:
+            emit(conn, {"v": 1, "ev": "text_delta", "session_id": sid, "text": "FAKE_CHAT_RESPONSE: partial"})
+            emit(conn, {"v": 1, "ev": "turn_done", "session_id": sid})
+    elif req == "clear":
+        reply("ok")
+    elif req == "ping":
+        reply("pong")
+    else:
+        reply("error", code="unknown_request", message="unhandled: " + str(req))
+
+def serve(conn):
+    buf = b""
+    try:
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    frame = json.loads(line.decode())
+                except json.JSONDecodeError:
+                    continue
+                handle(conn, frame)
+    except (ConnectionError, OSError):
+        return
+
+def watchdog(sock_path):
+    while True:
+        time.sleep(0.5)
+        if not os.path.exists(sock_path):
+            os._exit(0)
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(8)
+threading.Thread(target=watchdog, args=(sock_path,), daemon=True).start()
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=serve, args=(conn,), daemon=True).start()
+`;
+
 async function waitFor(predicate, message, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -25,34 +163,44 @@ async function updateSetting(name, value) {
 }
 
 async function readInvocations(argsLog) {
-  const content = await fs.readFile(argsLog, "utf8");
-  return content.trim().split("\n").filter(Boolean).map((line) => line.split("\0"));
+  try {
+    const content = await fs.readFile(argsLog, "utf8");
+    return content.trim().split("\n").filter(Boolean).map((line) => line.split("\0"));
+  } catch {
+    return [];
+  }
+}
+
+async function readBridgeFrames(bridgeLog) {
+  try {
+    const content = await fs.readFile(bridgeLog, "utf8");
+    return content.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
 }
 
 async function run() {
   const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "jcode-vscode-test-"));
+  const resultMarker = path.join(os.tmpdir(), "jcode-vscode-acceptance-result.txt");
+  try {
+    await fs.unlink(resultMarker);
+  } catch {
+    // No previous result; first run.
+  }
   const argsLog = path.join(scratch, "args.log");
+  const bridgeLog = path.join(scratch, "bridge.log");
+  const apiSocket = path.join(scratch, "api.sock");
   const fakeJcode = path.join(scratch, "fake-jcode.py");
   const sourceFile = path.join(scratch, "sample.js");
 
-  await fs.writeFile(
-    fakeJcode,
-    [
-      "#!/usr/bin/env python3",
-      "import json, sys, time",
-      "args = sys.argv[1:]",
-      `open(${JSON.stringify(argsLog)}, 'a').write('\\0'.join(args) + '\\n')`,
-      "if 'run' in args:",
-      "    prompt = args[-1]",
-      "    if 'WAIT_FOR_CANCEL' in prompt:",
-      "        time.sleep(30)",
-      "    print(json.dumps({'session_id': 'fake-session-1', 'provider': 'test-provider', 'model': 'test-model', 'text': 'FAKE_CHAT_RESPONSE: ' + prompt[:80]}))",
-      "    sys.exit(0)",
-      "for _line in sys.stdin:",
-      "    pass",
-    ].join("\n"),
-    { mode: 0o755 },
-  );
+  // The extension (running in this same Extension Host) reads these variables
+  // to know where to reach the bridge and where the fake should log.
+  process.env.JCODE_API_SOCKET = apiSocket;
+  process.env.FAKE_ARGS_LOG = argsLog;
+  process.env.FAKE_BRIDGE_LOG = bridgeLog;
+
+  await fs.writeFile(fakeJcode, FAKE_BRIDGE_PY, { mode: 0o755 });
   await fs.writeFile(sourceFile, "const alpha = 1;\nconst beta = alpha + 2;\n");
 
   const extension = vscode.extensions.getExtension(EXTENSION_ID);
@@ -70,6 +218,8 @@ async function run() {
     "jcode._test.sendChat",
     "jcode._test.newChat",
     "jcode._test.cancelChat",
+    "jcode._test.setModel",
+    "jcode._test.setEffort",
     "jcode._test.captureSelection",
   ]) {
     assert.ok(commands.includes(command), `${command} must be registered`);
@@ -102,21 +252,16 @@ async function run() {
   assert.match(firstResult.text, /FAKE_CHAT_RESPONSE/);
   assert.equal(firstResult.session_id, "fake-session-1");
 
-  let invocations = await readInvocations(argsLog);
-  const firstArgs = invocations[0];
-  assert.ok(firstArgs.includes("-C"));
-  assert.ok(firstArgs.includes(scratch));
-  assert.ok(firstArgs.includes("--provider"));
-  assert.ok(firstArgs.includes("test-provider"));
-  assert.ok(firstArgs.includes("run"));
-  assert.ok(firstArgs.includes("--json"));
-  assert.ok(firstArgs.includes("--no-update"));
-  assert.equal(firstArgs.includes("--resume"), false);
-
-  const firstPrompt = firstArgs.at(-1);
-  assert.match(firstPrompt, /Explain the selected identifiers/);
-  assert.match(firstPrompt, /sample\.js/);
-  const contextMatch = firstPrompt.match(/Read the exact selection and range metadata from ("(?:[^"\\]|\\.)+")/);
+  let frames = await readBridgeFrames(bridgeLog);
+  const createFrame = frames.find((frame) => frame.req === "create_session");
+  assert.ok(createFrame, "a session must be created through the harness API");
+  const firstSend = frames.find(
+    (frame) => frame.req === "send_message" && (frame.content || "").includes("Explain the selected identifiers"),
+  );
+  assert.ok(firstSend, "the chat message must reach the harness API");
+  assert.equal(firstSend.session_id, "fake-session-1");
+  assert.match(firstSend.content, /sample\.js/);
+  const contextMatch = firstSend.content.match(/Read the exact selection and range metadata from ("(?:[^"\\]|\\.)+")/);
   assert.ok(contextMatch, "prompt must include a JSON-quoted context path");
   const contextPath = JSON.parse(contextMatch[1]);
   const contextText = await fs.readFile(contextPath, "utf8");
@@ -142,16 +287,45 @@ async function run() {
     false,
   );
   assert.match(secondResult.text, /FAKE_CHAT_RESPONSE/);
-  invocations = await readInvocations(argsLog);
-  const secondArgs = invocations[1];
-  assert.ok(secondArgs.includes("--resume"));
-  assert.equal(secondArgs[secondArgs.indexOf("--resume") + 1], "fake-session-1");
-  assert.equal(secondArgs.at(-1), "Continue without attaching a selection.");
+  assert.equal(secondResult.session_id, "fake-session-1", "multi-turn chat must reuse the session");
+  frames = await readBridgeFrames(bridgeLog);
+  assert.equal(
+    frames.filter((frame) => frame.req === "create_session").length,
+    1,
+    "multi-turn chat must not create a second session",
+  );
+  assert.ok(
+    frames.some(
+      (frame) =>
+        frame.req === "send_message" &&
+        frame.content === "Continue without attaching a selection." &&
+        frame.session_id === "fake-session-1",
+    ),
+  );
 
-  const invocationCount = invocations.length;
+  await vscode.commands.executeCommand("jcode._test.setModel", "gpt-5.5");
+  frames = await readBridgeFrames(bridgeLog);
+  const setModelFrame = frames.find((frame) => frame.req === "set_model");
+  assert.ok(setModelFrame, "changing the model must call set_model");
+  assert.equal(setModelFrame.model, "gpt-5.5");
+  assert.equal(setModelFrame.session_id, "fake-session-1");
+
+  await vscode.commands.executeCommand("jcode._test.setEffort", "high");
+  frames = await readBridgeFrames(bridgeLog);
+  const setEffortFrame = frames.find((frame) => frame.req === "set_reasoning_effort");
+  assert.ok(setEffortFrame, "changing the effort must call set_reasoning_effort");
+  assert.equal(setEffortFrame.effort, "high");
+  assert.equal(setEffortFrame.session_id, "fake-session-1");
+
+  // A rejected model must not break the session; the error surfaces as a notice.
+  await vscode.commands.executeCommand("jcode._test.setModel", "bad-model");
+  frames = await readBridgeFrames(bridgeLog);
+  assert.ok(frames.some((frame) => frame.req === "set_model" && frame.model === "bad-model"));
+
+  const framesBeforeNoop = (await readBridgeFrames(bridgeLog)).length;
   await vscode.commands.executeCommand("jcode.explainSelection");
   await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.equal((await readInvocations(argsLog)).length, invocationCount);
+  assert.equal((await readBridgeFrames(bridgeLog)).length, framesBeforeNoop);
 
   await updateSetting("maxSelectionCharacters", 1000);
   const largeDocument = await vscode.workspace.openTextDocument({
@@ -162,7 +336,8 @@ async function run() {
   largeEditor.selection = new vscode.Selection(0, 0, 0, 1200);
   await vscode.commands.executeCommand("jcode.fixSelection");
   await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.equal((await readInvocations(argsLog)).length, invocationCount);
+  assert.equal((await readBridgeFrames(bridgeLog)).length, framesBeforeNoop);
+  await updateSetting("maxSelectionCharacters", 200000);
 
   await vscode.commands.executeCommand("jcode._test.newChat");
   await vscode.commands.executeCommand(
@@ -170,20 +345,25 @@ async function run() {
     "A fresh conversation.",
     false,
   );
-  invocations = await readInvocations(argsLog);
-  const freshArgs = invocations[2];
-  assert.equal(freshArgs.includes("--resume"), false);
+  frames = await readBridgeFrames(bridgeLog);
+  const freshSession = frames.filter((frame) => frame.req === "create_session");
+  assert.equal(freshSession.length, 2, "New Chat must create a second session");
+  assert.equal(freshSession[1].id !== undefined, true);
 
+  await vscode.commands.executeCommand("jcode._test.setModel", "");
+  await vscode.commands.executeCommand("jcode._test.setEffort", "");
+
+  await vscode.window.showTextDocument(document);
   await vscode.commands.executeCommand("jcode.openTerminal");
   const firstTerminal = await waitFor(
     () => vscode.window.terminals.find((terminal) => terminal.name === "Jcode"),
     "Jcode terminal to be visible",
   );
-  invocations = await waitFor(async () => {
+  const invocations = await waitFor(async () => {
     const current = await readInvocations(argsLog);
-    return current.length >= 4 ? current : undefined;
+    return current.length >= 1 ? current : undefined;
   }, "terminal process to start");
-  const terminalArgs = invocations[3];
+  const terminalArgs = invocations[0];
   assert.deepEqual(terminalArgs.slice(-2), ["--provider", "test-provider"]);
   assert.ok(terminalArgs.includes("-C"));
   assert.ok(terminalArgs.includes(scratch));
@@ -223,9 +403,9 @@ async function run() {
     false,
   );
   await waitFor(async () => {
-    const current = await readInvocations(argsLog);
-    return current.some((args) => args.at(-1) === "WAIT_FOR_CANCEL");
-  }, "cancellable chat process to start");
+    const current = await readBridgeFrames(bridgeLog);
+    return current.some((frame) => frame.req === "send_message" && frame.content === "WAIT_FOR_CANCEL");
+  }, "cancellable message to be sent");
   await vscode.commands.executeCommand("jcode._test.cancelChat");
   assert.equal(await cancellation, undefined);
   const afterCancellation = await vscode.commands.executeCommand(
@@ -238,8 +418,12 @@ async function run() {
   await updateSetting("executablePath", undefined);
   await updateSetting("launchArguments", undefined);
   await updateSetting("maxSelectionCharacters", undefined);
+  delete process.env.JCODE_API_SOCKET;
+  delete process.env.FAKE_ARGS_LOG;
+  delete process.env.FAKE_BRIDGE_LOG;
   await vscode.commands.executeCommand("jcode._test.newChat");
   await vscode.commands.executeCommand("workbench.action.closeAllEditors");
+  await fs.writeFile(resultMarker, "PASS\n");
   await fs.rm(scratch, { recursive: true, force: true });
 
   console.log("JCODE_VSCODE_ACCEPTANCE: PASS");

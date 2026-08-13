@@ -1,0 +1,15 @@
+# The SDK's optional platform binaries are only needed for launch() (embedding
+# a private jcode instance). The extension only uses connect() against the
+# user's `jcode api-bridge`, so exclude the binaries from the package.
+node_modules/@1jehuang/jcode-darwin-arm64/**
+node_modules/@1jehuang/jcode-darwin-x64/**
+node_modules/@1jehuang/jcode-linux-arm64/**
+node_modules/@1jehuang/jcode-linux-x64/**
+node_modules/@1jehuang/jcode-win32-arm64/**
+node_modules/@1jehuang/jcode-win32-x64/**
+
+# Local artifacts
+**/*.vsix
+server.log
+bun.lock
+**/*.map

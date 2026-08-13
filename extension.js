@@ -5,9 +5,144 @@ const vscode = require("vscode");
 const TERMINAL_NAME = "Jcode";
 const CHAT_VIEW_ID = "jcode.chatView";
 const CHAT_SESSION_KEY = "jcode.chat.sessionId";
+const CHAT_MODEL_KEY = "jcode.chat.model";
+const CHAT_EFFORT_KEY = "jcode.chat.effort";
 const MAX_SELECTION_SNAPSHOTS = 20;
+const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const DEFAULT_MODELS = [
+  "deepseek-v4-flash",
+  "deepseek-v4-pro",
+  "deepseek-v4-flash-free",
+  "claude-opus-5",
+  "claude-opus-4-8",
+  "claude-opus-4-6",
+  "claude-sonnet-5",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-5",
+  "gpt-5.6-pro",
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gemini-3.5-flash",
+  "gemini-3.1-pro",
+  "grok-4.6",
+  "glm-5.2",
+  "kimi-k3",
+  "qwen3.6-plus",
+  "minimax-m3",
+];
+const CLIENT_NAME = "jcode-vscode/0.3.0";
+const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
+
 let jcodeTerminal;
 let lastTextEditor;
+
+// The chat backend talks to the user's jcode through the official TypeScript
+// SDK (@1jehuang/jcode-sdk), which dials the `jcode api-bridge` Unix socket.
+// The bridge is started automatically (detached) the first time it is needed,
+// unless one is already running. Model picker entries come from the daemon's
+// live catalog (listModels), and the model and reasoning-effort selectors
+// drive setModel / setReasoningEffort on the session.
+let sdkPromise;
+let clientPromise;
+let bridgeProcess;
+
+function getSdk() {
+  if (!sdkPromise) {
+    sdkPromise = import("@1jehuang/jcode-sdk").catch((error) => {
+      sdkPromise = undefined;
+      throw new Error(
+        `The Jcode TypeScript SDK could not be loaded (${error.message}). ` +
+          'Install extension dependencies with "npm install" in the extension folder, then reload the window.',
+      );
+    });
+  }
+  return sdkPromise;
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Connect to the harness API, starting `jcode api-bridge` when needed. */
+async function getJcodeClient() {
+  if (!clientPromise) {
+    clientPromise = connectWithBridge();
+  }
+  try {
+    const client = await clientPromise;
+    return client;
+  } catch (error) {
+    clientPromise = undefined;
+    throw error;
+  }
+}
+
+async function connectWithBridge() {
+  const { JcodeClient } = await getSdk();
+  const apiSocket = process.env.JCODE_API_SOCKET;
+  try {
+    const client = await JcodeClient.connect({ clientName: CLIENT_NAME, socketPath: apiSocket });
+    watchClientLiveness(client);
+    return client;
+  } catch (firstError) {
+    if (firstError?.code !== "connect_failed") {
+      throw firstError;
+    }
+    spawnBridge(apiSocket);
+    const deadline = Date.now() + BRIDGE_CONNECT_TIMEOUT_MS;
+    let lastError = firstError;
+    while (Date.now() < deadline) {
+      await sleep(300);
+      try {
+        const client = await JcodeClient.connect({ clientName: CLIENT_NAME, socketPath: apiSocket });
+        watchClientLiveness(client);
+        return client;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw new Error(
+      `Could not reach the Jcode harness API (${errorMessage(lastError)}). ` +
+        "Make sure the Jcode CLI is installed and new enough to support `jcode api-bridge`.",
+    );
+  }
+}
+
+function watchClientLiveness(client) {
+  client.on("close", () => {
+    clientPromise = undefined;
+  });
+}
+
+function spawnBridge(apiSocket) {
+  if (bridgeProcess && bridgeProcess.exitCode === null && bridgeProcess.signalCode === null) {
+    return;
+  }
+  const config = vscode.workspace.getConfiguration("jcode");
+  const executable = config.get("executablePath", "jcode");
+  const configuredArguments = config.get("launchArguments", []);
+  const args = [...configuredArguments, "--no-update", "api-bridge"];
+  if (apiSocket) {
+    args.push("--api-socket", apiSocket);
+  }
+  try {
+    const child = spawn(executable, args, {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env },
+    });
+    child.unref();
+    bridgeProcess = child;
+  } catch (error) {
+    // A missing executable surfaces asynchronously through the poll loop
+    // in connectWithBridge, which reports the actionable error.
+  }
+}
 
 /**
  * @param {vscode.ExtensionContext} context
@@ -21,7 +156,7 @@ function activate(context) {
       webviewOptions: { retainContextWhenHidden: true },
     }),
     vscode.commands.registerCommand("jcode.open", () => chatProvider.focus()),
-    vscode.commands.registerCommand("jcode.openTerminal", () => openJcodeTerminal()),
+    vscode.commands.registerCommand("jcode.openTerminal", () => openJcodeTerminal(context)),
     vscode.commands.registerCommand("jcode.askSelection", () =>
       chatProvider.stageCurrentSelection(),
     ),
@@ -58,6 +193,12 @@ function activate(context) {
       ),
       vscode.commands.registerCommand("jcode._test.newChat", () => chatProvider.newChat()),
       vscode.commands.registerCommand("jcode._test.cancelChat", () => chatProvider.cancel()),
+      vscode.commands.registerCommand("jcode._test.setModel", (model) =>
+        chatProvider.setSelectedModel(model),
+      ),
+      vscode.commands.registerCommand("jcode._test.setEffort", (effort) =>
+        chatProvider.setSelectedEffort(effort),
+      ),
       vscode.commands.registerCommand("jcode._test.captureSelection", () =>
         captureSelectionContext(context, false),
       ),
@@ -71,7 +212,10 @@ class JcodeChatViewProvider {
     this.context = context;
     this.view = undefined;
     this.pendingSelection = undefined;
-    this.activeRun = undefined;
+    this.running = false;
+    this.cancelRequested = false;
+    this.sessionId = undefined;
+    this.modelWatcher = undefined;
     this.disposed = false;
   }
 
@@ -83,30 +227,35 @@ class JcodeChatViewProvider {
     const messageSubscription = webviewView.webview.onDidReceiveMessage(async (message) => {
       switch (message?.type) {
         case "ready":
-          this.post({
-            type: "restore",
-            sessionId: this.context.workspaceState.get(CHAT_SESSION_KEY),
-            selection: this.pendingSelection?.label,
-          });
+          await this.restoreChat();
           break;
         case "send":
-          await this.sendMessage(message.text, message.includeSelection !== false);
+          await this.sendMessage(message.text, message.includeSelection !== false, undefined, {
+            model: message.model,
+            effort: message.effort,
+          });
           break;
         case "cancel":
-          this.cancel();
+          await this.cancel();
           break;
         case "newChat":
           await this.newChat();
           break;
         case "openTerminal":
-          openJcodeTerminal();
+          openJcodeTerminal(this.context);
+          break;
+        case "model":
+          await this.setSelectedModel(message.model);
+          break;
+        case "effort":
+          await this.setSelectedEffort(message.effort);
           break;
       }
     });
 
     webviewView.onDidDispose(() => {
       messageSubscription.dispose();
-      this.cancel();
+      void this.cancel();
       if (this.view === webviewView) {
         this.view = undefined;
       }
@@ -115,6 +264,154 @@ class JcodeChatViewProvider {
 
   async focus() {
     await vscode.commands.executeCommand(`${CHAT_VIEW_ID}.focus`);
+  }
+
+  getModelList() {
+    const configured = vscode.workspace.getConfiguration("jcode").get("models", []);
+    return Array.isArray(configured) && configured.length > 0 ? configured : DEFAULT_MODELS;
+  }
+
+  getSelectedModel() {
+    const saved = this.context.workspaceState.get(CHAT_MODEL_KEY);
+    if (saved) {
+      return saved;
+    }
+    return vscode.workspace.getConfiguration("jcode").get("defaultModel", "");
+  }
+
+  getSelectedEffort() {
+    const saved = this.context.workspaceState.get(CHAT_EFFORT_KEY);
+    if (saved) {
+      return saved;
+    }
+    return vscode.workspace.getConfiguration("jcode").get("defaultEffort", "");
+  }
+
+  async setSelectedModel(model) {
+    const value = typeof model === "string" ? model.trim() : "";
+    await this.context.workspaceState.update(CHAT_MODEL_KEY, value || undefined);
+    if (!value) {
+      return;
+    }
+    try {
+      const client = await getJcodeClient();
+      if (!this.sessionId) {
+        await this.ensureSession();
+      }
+      await client.setModel(this.sessionId, value);
+      this.post({ type: "options", model: value });
+    } catch (error) {
+      this.post({ type: "notice", text: `Could not switch model: ${errorMessage(error)}` });
+    }
+  }
+
+  async setSelectedEffort(effort) {
+    const value = typeof effort === "string" ? effort.trim() : "";
+    await this.context.workspaceState.update(CHAT_EFFORT_KEY, value || undefined);
+    if (!value) {
+      return;
+    }
+    try {
+      const client = await getJcodeClient();
+      if (!this.sessionId) {
+        await this.ensureSession();
+      }
+      await client.setReasoningEffort(this.sessionId, value);
+      this.post({ type: "options", effort: value });
+    } catch (error) {
+      this.post({ type: "notice", text: `Could not set reasoning effort: ${errorMessage(error)}` });
+    }
+  }
+
+  /**
+   * Attach to the workspace session, creating it on first use, and apply any
+   * saved model / effort defaults when a new session is created. Returns the
+   * connected SDK client.
+   */
+  async ensureSession() {
+    const client = await getJcodeClient();
+    if (!this.sessionId) {
+      const savedId = this.context.workspaceState.get(CHAT_SESSION_KEY);
+      if (savedId) {
+        try {
+          await client.attachSession(savedId);
+          this.sessionId = savedId;
+        } catch {
+          // The session is gone or belongs to another instance; create fresh.
+        }
+      }
+    }
+    if (!this.sessionId) {
+      const workingDir = getWorkingDirectory(getCurrentTextEditor());
+      const session = await client.createSession(workingDir);
+      this.sessionId = session.session_id;
+      await this.context.workspaceState.update(CHAT_SESSION_KEY, session.session_id);
+      await this.applySessionDefaults(client);
+    }
+    return client;
+  }
+
+  async applySessionDefaults(client) {
+    const model = this.getSelectedModel();
+    if (model) {
+      try {
+        await client.setModel(this.sessionId, model);
+      } catch {
+        // The daemon rejects models its catalog does not offer; the picker
+        // still shows the saved choice and errors surface on explicit changes.
+      }
+    }
+    const effort = this.getSelectedEffort();
+    if (effort) {
+      try {
+        await client.setReasoningEffort(this.sessionId, effort);
+      } catch {
+        // Accepted effort levels are per-provider, so a level one provider
+        // rejects may be fine on another; keep the saved value.
+      }
+    }
+  }
+
+  async restoreChat() {
+    const selection = this.pendingSelection?.label;
+    let sessionId;
+    let models = [];
+    let current;
+    let error;
+    try {
+      const client = await this.ensureSession();
+      sessionId = this.sessionId;
+      try {
+        ({ models, current } = await client.listModels(sessionId));
+      } catch {
+        models = [];
+      }
+      this.watchModel(client);
+    } catch (caught) {
+      error = errorMessage(caught);
+    }
+    this.post({
+      type: "restore",
+      sessionId,
+      selection,
+      models: models.length > 0 ? models : this.getModelList(),
+      model: this.getSelectedModel() || current || "",
+      effortLevels: EFFORT_LEVELS,
+      effort: this.getSelectedEffort(),
+      error,
+    });
+  }
+
+  watchModel(client) {
+    if (this.modelWatcher) {
+      client.off("model_info", this.modelWatcher);
+    }
+    this.modelWatcher = (event) => {
+      if (event.session_id === this.sessionId && event.model) {
+        this.post({ type: "options", model: event.model });
+      }
+    };
+    client.on("model_info", this.modelWatcher);
   }
 
   async stageCurrentSelection() {
@@ -139,15 +436,22 @@ class JcodeChatViewProvider {
     return this.sendMessage(instruction, true, selection);
   }
 
-  async sendMessage(text, includeSelection = true, explicitSelection) {
+  async sendMessage(text, includeSelection = true, explicitSelection, options = {}) {
     const instruction = typeof text === "string" ? text.trim() : "";
     if (!instruction) {
       return undefined;
     }
 
-    if (this.activeRun) {
+    if (this.running) {
       void vscode.window.showInformationMessage("Jcode is already responding. Cancel it before sending another message.");
       return undefined;
+    }
+
+    if (options.model !== undefined) {
+      await this.setSelectedModel(options.model);
+    }
+    if (options.effort !== undefined) {
+      await this.setSelectedEffort(options.effort);
     }
 
     let selection = explicitSelection;
@@ -159,6 +463,8 @@ class JcodeChatViewProvider {
     await this.focus();
     this.post({ type: "user", text: instruction, selection: selection?.label });
     this.post({ type: "running", running: true });
+    this.running = true;
+    this.cancelRequested = false;
 
     const prompt = selection
       ? [
@@ -170,114 +476,94 @@ class JcodeChatViewProvider {
       : instruction;
 
     try {
-      const result = await this.runJcode(prompt);
+      const result = await this.runTurn(prompt);
       this.post({
         type: "assistant",
         text: result.text || "Jcode completed without returning text.",
         provider: result.provider,
         model: result.model,
       });
+      if (this.cancelRequested) {
+        return undefined;
+      }
       return result;
     } catch (error) {
-      if (error?.cancelled) {
+      if (this.cancelRequested || error?.cancelled) {
         this.post({ type: "notice", text: "Response cancelled." });
       } else {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = errorMessage(error);
         this.post({ type: "error", text: message });
         void vscode.window.showErrorMessage(`Jcode chat failed: ${message}`);
       }
       return undefined;
     } finally {
+      this.running = false;
+      this.cancelRequested = false;
       this.post({ type: "running", running: false });
     }
   }
 
-  async runJcode(prompt) {
-    const config = vscode.workspace.getConfiguration("jcode");
-    const executable = config.get("executablePath", "jcode");
-    const configuredArguments = config.get("launchArguments", []);
-    const cwd = getWorkingDirectory(getCurrentTextEditor());
-    const sessionId = this.context.workspaceState.get(CHAT_SESSION_KEY);
-    const args = [];
-
-    if (cwd) {
-      args.push("-C", cwd);
+  async runTurn(prompt) {
+    const client = await this.ensureSession();
+    const sessionId = this.sessionId;
+    let provider;
+    let model;
+    try {
+      const runtime = await client.getRuntimeInfo(sessionId);
+      provider = runtime.provider;
+      model = runtime.model;
+    } catch {
+      // Runtime info is best-effort; the turn can still run without it.
     }
-    args.push(...configuredArguments, "run", "--json", "--no-update");
-    if (sessionId) {
-      args.push("--resume", sessionId);
-    }
-    args.push(prompt);
-
-    return new Promise((resolve, reject) => {
-      const child = spawn(executable, args, {
-        cwd,
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      this.activeRun = child;
-
-      let stdout = "";
-      let stderr = "";
-      let cancelled = false;
-      const outputLimit = 16 * 1024 * 1024;
-
-      const append = (current, chunk) => {
-        const next = current + chunk;
-        return next.length > outputLimit ? next.slice(-outputLimit) : next;
-      };
-
-      child.stdout.setEncoding("utf8");
-      child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk) => {
-        stdout = append(stdout, chunk);
-      });
-      child.stderr.on("data", (chunk) => {
-        stderr = append(stderr, chunk);
-      });
-      child.on("error", (error) => {
-        this.activeRun = undefined;
-        reject(error);
-      });
-      child.on("close", async (code, signal) => {
-        this.activeRun = undefined;
-        cancelled = signal !== null || code === null;
-        if (cancelled) {
-          reject(Object.assign(new Error("Jcode response was cancelled."), { cancelled: true }));
-          return;
+    const result = await client.run(sessionId, prompt, {
+      autoApprove: true,
+      onEvent: (event) => {
+        if (event.ev === "text_delta") {
+          this.post({ type: "delta", text: event.text });
+        } else if (event.ev === "model_info" && event.model) {
+          this.post({ type: "options", model: event.model });
         }
-        if (code !== 0) {
-          reject(new Error(stderr.trim() || `jcode run exited with code ${code}`));
-          return;
-        }
-
-        try {
-          const result = JSON.parse(stdout.trim());
-          if (!result || typeof result.text !== "string") {
-            throw new Error("Jcode returned an unexpected JSON response.");
-          }
-          if (result.session_id) {
-            await this.context.workspaceState.update(CHAT_SESSION_KEY, result.session_id);
-          }
-          resolve(result);
-        } catch (error) {
-          reject(new Error(`Could not read Jcode response: ${error.message}`));
-        }
-      });
+      },
     });
+    return { text: result.text, session_id: sessionId, provider, model };
   }
 
-  cancel() {
-    if (this.activeRun) {
-      this.activeRun.kill();
+  async cancel() {
+    this.cancelRequested = true;
+    if (!clientPromise) {
+      return;
+    }
+    try {
+      const client = await clientPromise;
+      if (this.sessionId) {
+        await client.cancel(this.sessionId);
+      }
+    } catch {
+      // The daemon may already have finished the turn; nothing to cancel.
     }
   }
 
   async newChat() {
-    this.cancel();
+    this.cancelRequested = true;
+    if (clientPromise) {
+      try {
+        const client = await clientPromise;
+        if (this.sessionId) {
+          await client.cancel(this.sessionId);
+        }
+      } catch {
+        // Ignore; a fresh session is created below regardless.
+      }
+    }
     this.pendingSelection = undefined;
+    this.sessionId = undefined;
     await this.context.workspaceState.update(CHAT_SESSION_KEY, undefined);
     this.post({ type: "cleared" });
+    try {
+      await this.ensureSession();
+    } catch (error) {
+      this.post({ type: "notice", text: `Could not start a new Jcode session: ${errorMessage(error)}` });
+    }
   }
 
   post(message) {
@@ -286,7 +572,7 @@ class JcodeChatViewProvider {
 
   dispose() {
     this.disposed = true;
-    this.cancel();
+    void this.cancel();
   }
 }
 
@@ -396,7 +682,7 @@ async function pruneSelectionContexts(directory) {
   );
 }
 
-function openJcodeTerminal(editor = getCurrentTextEditor()) {
+function openJcodeTerminal(context, editor = getCurrentTextEditor()) {
   if (jcodeTerminal && !jcodeTerminal.exitStatus) {
     jcodeTerminal.show(false);
     return jcodeTerminal;
@@ -408,11 +694,25 @@ function openJcodeTerminal(editor = getCurrentTextEditor()) {
   const cwd = getWorkingDirectory(editor);
   const args = cwd ? ["-C", cwd, ...configuredArguments] : configuredArguments;
 
+  const model = context.workspaceState.get(CHAT_MODEL_KEY) || config.get("defaultModel", "");
+  const hasExplicitModel = args.includes("-m") || args.includes("--model");
+  if (model && !hasExplicitModel) {
+    args.push("-m", model);
+  }
+
+  const env = { ...process.env };
+  const effort = context.workspaceState.get(CHAT_EFFORT_KEY) || config.get("defaultEffort", "");
+  if (effort) {
+    env.JCODE_OPENAI_REASONING_EFFORT = effort;
+    env.JCODE_ANTHROPIC_REASONING_EFFORT = effort;
+  }
+
   jcodeTerminal = vscode.window.createTerminal({
     name: TERMINAL_NAME,
     shellPath: executable,
     shellArgs: args,
     cwd,
+    env,
     iconPath: new vscode.ThemeIcon("sparkle"),
     isTransient: false,
   });
@@ -563,6 +863,27 @@ function getChatHtml(webview) {
       background: transparent;
     }
     .textarea::placeholder { color: var(--vscode-input-placeholderForeground); opacity: 1; }
+    .model-row { display: flex; align-items: center; gap: 6px; padding: 0 6px 6px 9px; }
+    .model-input {
+      flex: 1;
+      min-width: 0;
+      border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
+      border-radius: 5px;
+      padding: 3px 7px;
+      color: var(--vscode-input-foreground);
+      background: var(--vscode-input-background);
+      font-size: 11px;
+    }
+    .model-input::placeholder { color: var(--vscode-input-placeholderForeground); opacity: 1; }
+    .effort-select {
+      max-width: 116px;
+      border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
+      border-radius: 5px;
+      padding: 3px 4px;
+      color: var(--vscode-input-foreground);
+      background: var(--vscode-input-background);
+      font-size: 11px;
+    }
     .composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 6px 6px 9px; }
     .context-toggle { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--vscode-descriptionForeground); font-size: 11px; }
     .context-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -593,6 +914,11 @@ function getChatHtml(webview) {
       <div id="selection" class="selection" title=""></div>
       <div class="composer">
         <textarea id="prompt" class="textarea" rows="3" aria-label="Message Jcode" placeholder="Ask Jcode about this workspace…"></textarea>
+        <div class="model-row">
+          <input id="model" class="model-input" list="model-suggestions" autocomplete="off" spellcheck="false" placeholder="Model (auto)" aria-label="Model" title="Model. Type any name or pick a suggestion; empty uses Jcode's default.">
+          <datalist id="model-suggestions"></datalist>
+          <select id="effort" class="effort-select" aria-label="Reasoning effort" title="Reasoning effort. Empty uses Jcode's default; accepted levels depend on the provider."></select>
+        </div>
         <div class="composer-footer">
           <label class="context-toggle" title="Attach the current editor selection when available">
             <input id="include-selection" type="checkbox" checked>
@@ -613,7 +939,11 @@ function getChatHtml(webview) {
     const prompt = document.getElementById("prompt");
     const selection = document.getElementById("selection");
     const includeSelection = document.getElementById("include-selection");
+    const modelInput = document.getElementById("model");
+    const modelSuggestions = document.getElementById("model-suggestions");
+    const effortSelect = document.getElementById("effort");
     const saved = vscode.getState() || { messages: [] };
+    let liveBubble = undefined;
 
     if (navigator.platform.includes("Mac")) {
       document.getElementById("shortcut").textContent = "Cmd+Shift+J";
@@ -651,6 +981,32 @@ function getChatHtml(webview) {
       persist();
     }
 
+    function createLiveBubble() {
+      empty.hidden = true;
+      document.getElementById("typing")?.remove();
+      const item = document.createElement("article");
+      item.className = "chat chat-start";
+      item.dataset.role = "assistant";
+      const header = document.createElement("div");
+      header.className = "chat-header";
+      header.textContent = "Jcode";
+      const bubble = document.createElement("div");
+      bubble.className = "chat-bubble";
+      const footer = document.createElement("div");
+      footer.className = "chat-footer";
+      item.append(header, bubble, footer);
+      messages.append(item);
+      messages.scrollTop = messages.scrollHeight;
+      return { item, bubble, footer };
+    }
+
+    function finalizeLiveBubble(meta = "") {
+      if (!liveBubble) return;
+      liveBubble.footer.textContent = meta;
+      liveBubble = undefined;
+      persist();
+    }
+
     function appendNotice(text, isError = false) {
       empty.hidden = true;
       const notice = document.createElement("div");
@@ -664,6 +1020,36 @@ function getChatHtml(webview) {
       selection.textContent = label || "";
       selection.title = label || "";
       selection.classList.toggle("visible", Boolean(label));
+    }
+
+    function populateModelOptions(models) {
+      modelSuggestions.replaceChildren();
+      for (const name of models) {
+        const option = document.createElement("option");
+        option.value = name;
+        modelSuggestions.append(option);
+      }
+    }
+
+    function populateEffortOptions(levels) {
+      effortSelect.replaceChildren();
+      const auto = document.createElement("option");
+      auto.value = "";
+      auto.textContent = "Effort: auto";
+      effortSelect.append(auto);
+      for (const level of levels) {
+        const option = document.createElement("option");
+        option.value = level;
+        option.textContent = level;
+        effortSelect.append(option);
+      }
+    }
+
+    function applyOptions(data) {
+      populateModelOptions(data.models || []);
+      populateEffortOptions(data.effortLevels || []);
+      if (data.model !== undefined) modelInput.value = data.model;
+      if (data.effort !== undefined) effortSelect.value = data.effort;
     }
 
     function setRunning(running) {
@@ -680,13 +1066,20 @@ function getChatHtml(webview) {
         messages.scrollTop = messages.scrollHeight;
       } else if (!running) {
         typing?.remove();
+        finalizeLiveBubble();
       }
     }
 
     function send() {
       const text = prompt.value.trim();
       if (!text || document.body.classList.contains("running")) return;
-      vscode.postMessage({ type: "send", text, includeSelection: includeSelection.checked });
+      vscode.postMessage({
+        type: "send",
+        text,
+        includeSelection: includeSelection.checked,
+        model: modelInput.value.trim(),
+        effort: effortSelect.value,
+      });
       prompt.value = "";
       prompt.style.height = "auto";
     }
@@ -711,21 +1104,46 @@ function getChatHtml(webview) {
     document.getElementById("new-chat").addEventListener("click", () => vscode.postMessage({ type: "newChat" }));
     document.getElementById("terminal").addEventListener("click", () => vscode.postMessage({ type: "openTerminal" }));
 
+    modelInput.addEventListener("change", () => {
+      vscode.postMessage({ type: "model", model: modelInput.value.trim() });
+    });
+    effortSelect.addEventListener("change", () => {
+      vscode.postMessage({ type: "effort", effort: effortSelect.value });
+    });
+
     window.addEventListener("message", ({ data }) => {
       switch (data.type) {
         case "restore":
           setSelection(data.selection);
+          applyOptions(data);
+          if (data.error) appendNotice(data.error, true);
           break;
         case "selection":
           setSelection(data.selection);
           if (data.focusComposer) prompt.focus();
           break;
+        case "options":
+          if (data.model !== undefined) modelInput.value = data.model;
+          if (data.effort !== undefined) effortSelect.value = data.effort;
+          break;
         case "user":
           appendMessage("user", data.text, data.selection || "");
           setSelection("");
           break;
+        case "delta":
+          if (!liveBubble) liveBubble = createLiveBubble();
+          liveBubble.bubble.textContent += data.text;
+          messages.scrollTop = messages.scrollHeight;
+          break;
         case "assistant":
-          appendMessage("assistant", data.text, [data.provider, data.model].filter(Boolean).join(" · "));
+          if (liveBubble) {
+            liveBubble.bubble.textContent = data.text;
+            liveBubble.footer.textContent = [data.provider, data.model].filter(Boolean).join(" · ");
+            liveBubble = undefined;
+            persist();
+          } else {
+            appendMessage("assistant", data.text, [data.provider, data.model].filter(Boolean).join(" · "));
+          }
           break;
         case "notice":
           appendNotice(data.text);
@@ -737,6 +1155,7 @@ function getChatHtml(webview) {
           setRunning(data.running);
           break;
         case "cleared":
+          liveBubble = undefined;
           messages.querySelectorAll(":scope > :not(#empty)").forEach((node) => node.remove());
           empty.hidden = false;
           setSelection("");
@@ -761,6 +1180,25 @@ function getNonce() {
   return value;
 }
 
-function deactivate() {}
+function deactivate() {
+  if (bridgeProcess && bridgeProcess.exitCode === null && bridgeProcess.signalCode === null) {
+    try {
+      bridgeProcess.kill();
+    } catch {
+      // Already gone.
+    }
+    bridgeProcess = undefined;
+  }
+  if (clientPromise) {
+    clientPromise.then((client) => {
+      try {
+        client.close();
+      } catch {
+        // Already closed.
+      }
+    }).catch(() => {});
+    clientPromise = undefined;
+  }
+}
 
 module.exports = { activate, deactivate, JcodeChatViewProvider, captureSelectionContext };
