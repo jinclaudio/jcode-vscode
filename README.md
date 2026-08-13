@@ -12,6 +12,8 @@ explicitly send one or more editor selections to the agent.
 - Multiple selections are supported.
 - Unsaved selected text is supported. The extension writes an exact local snapshot
   under VS Code extension storage and tells Jcode to read it.
+- Prompts are submitted through Jcode's official `transcript --mode send` interface,
+  with terminal input retained as a compatibility fallback for older Jcode builds.
 - Selection content is only shared after an explicit command. It is not captured or
   transmitted continuously.
 

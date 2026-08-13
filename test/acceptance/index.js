@@ -92,10 +92,12 @@ async function run() {
   assert.match(contextText, /Selection 2 \(L2:C7-L2:C11\)[\s\S]*beta/);
 
   const argsText = await fs.readFile(argsLog, "utf8");
-  const firstArgs = argsText.trim().split("\0");
+  const invocations = argsText.trim().split("\n").map((line) => line.split("\0"));
+  const firstArgs = invocations[0];
   assert.deepEqual(firstArgs.slice(-2), ["--provider", "test-provider"]);
   assert.ok(firstArgs.includes("-C"));
   assert.ok(firstArgs.includes(scratch));
+  assert.deepEqual(invocations[1], ["transcript", "--mode", "send"]);
 
   const sentLength = prompt.length;
   editor.selections = [new vscode.Selection(0, 0, 0, 0)];
@@ -124,7 +126,7 @@ async function run() {
   await vscode.commands.executeCommand("jcode.open");
   await waitFor(async () => {
     const invocations = (await fs.readFile(argsLog, "utf8")).trim().split("\n");
-    return invocations.length >= 2;
+    return invocations.length >= 3;
   }, "terminal to restart after disposal");
 
   const restarted = vscode.window.terminals.find((terminal) => terminal.name === "Jcode");

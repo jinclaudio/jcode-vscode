@@ -1,8 +1,10 @@
 const path = require("node:path");
+const { spawn } = require("node:child_process");
 const vscode = require("vscode");
 
 const TERMINAL_NAME = "Jcode";
 let jcodeTerminal;
+let jcodeTerminalReady = Promise.resolve();
 
 /**
  * @param {vscode.ExtensionContext} context
@@ -22,6 +24,7 @@ function activate(context) {
     vscode.window.onDidCloseTerminal((terminal) => {
       if (terminal === jcodeTerminal) {
         jcodeTerminal = undefined;
+        jcodeTerminalReady = Promise.resolve();
       }
     }),
   );
@@ -81,7 +84,45 @@ async function sendSelection(context, instruction) {
   ].join(" ");
 
   const terminal = openJcode(editor);
-  terminal.sendText(prompt, true);
+  await jcodeTerminalReady;
+  await sendPromptToJcode(terminal, prompt, editor);
+}
+
+async function sendPromptToJcode(terminal, prompt, editor) {
+  const config = vscode.workspace.getConfiguration("jcode");
+  const executable = config.get("executablePath", "jcode");
+  const cwd = getWorkingDirectory(editor);
+
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn(executable, ["transcript", "--mode", "send"], {
+        cwd,
+        windowsHide: true,
+        stdio: ["pipe", "ignore", "pipe"],
+      });
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk;
+      });
+      child.on("error", reject);
+      child.on("close", (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(stderr.trim() || `jcode transcript exited with code ${code}`));
+        }
+      });
+      child.stdin.end(prompt);
+    });
+  } catch (error) {
+    // Older Jcode builds may not provide `transcript`. Preserve a functional
+    // fallback while making the degraded path visible to the user.
+    terminal.sendText(prompt, true);
+    void vscode.window.showWarningMessage(
+      `Jcode transcript injection failed; used terminal input fallback: ${error.message}`,
+    );
+  }
 }
 
 async function writeSelectionContext(context, editor, selectedText) {
@@ -130,8 +171,17 @@ function openJcode(editor = vscode.window.activeTextEditor) {
     iconPath: new vscode.ThemeIcon("sparkle"),
     isTransient: false,
   });
+  jcodeTerminalReady = waitForTerminalStartup(jcodeTerminal);
   jcodeTerminal.show(false);
   return jcodeTerminal;
+}
+
+async function waitForTerminalStartup(terminal) {
+  await terminal.processId;
+  // VS Code can accept sendText before a newly spawned full-screen TUI has
+  // installed its input handler. Give Jcode a short startup window so the
+  // first selection prompt is not consumed by terminal initialization.
+  await new Promise((resolve) => setTimeout(resolve, 750));
 }
 
 function getWorkingDirectory(editor) {
