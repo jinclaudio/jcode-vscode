@@ -133,6 +133,7 @@ async function run() {
 
   await updateSetting("executablePath", "jcode");
   await updateSetting("launchArguments", ["--no-update"]);
+  await vscode.window.showTextDocument(document);
   await vscode.commands.executeCommand("jcode.open");
   const realTerminal = await waitFor(
     () => vscode.window.terminals.find((terminal) => terminal.name === "Jcode"),
@@ -140,6 +141,16 @@ async function run() {
   );
   await new Promise((resolve) => setTimeout(resolve, 1500));
   assert.equal(realTerminal.exitStatus, undefined, "real Jcode process must remain running");
+  const realPid = await realTerminal.processId;
+  assert.ok(Number.isInteger(realPid) && realPid > 0, "real Jcode terminal must expose a process ID");
+  if (process.platform === "linux") {
+    const commandLine = (await fs.readFile(`/proc/${realPid}/cmdline`, "utf8"))
+      .split("\0")
+      .filter(Boolean);
+    assert.match(commandLine[0], /jcode/);
+    assert.ok(commandLine.includes("--no-update"));
+    assert.equal(await fs.readlink(`/proc/${realPid}/cwd`), scratch);
+  }
   realTerminal.dispose();
 
   await updateSetting("executablePath", undefined);
