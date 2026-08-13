@@ -5,6 +5,7 @@ const vscode = require("vscode");
 const TERMINAL_NAME = "Jcode";
 const CHAT_VIEW_ID = "jcode.chatView";
 const CHAT_SESSION_KEY = "jcode.chat.sessionId";
+const MAX_SELECTION_SNAPSHOTS = 20;
 let jcodeTerminal;
 let lastTextEditor;
 
@@ -56,6 +57,10 @@ function activate(context) {
         chatProvider.sendMessage(text, includeSelection),
       ),
       vscode.commands.registerCommand("jcode._test.newChat", () => chatProvider.newChat()),
+      vscode.commands.registerCommand("jcode._test.cancelChat", () => chatProvider.cancel()),
+      vscode.commands.registerCommand("jcode._test.captureSelection", () =>
+        captureSelectionContext(context, false),
+      ),
     );
   }
 }
@@ -101,6 +106,7 @@ class JcodeChatViewProvider {
 
     webviewView.onDidDispose(() => {
       messageSubscription.dispose();
+      this.cancel();
       if (this.view === webviewView) {
         this.view = undefined;
       }
@@ -369,7 +375,25 @@ async function writeSelectionContext(context, editor, selectedText) {
     `selection-${Date.now()}-${Math.random().toString(16).slice(2)}.md`,
   );
   await vscode.workspace.fs.writeFile(file, Buffer.from(metadata, "utf8"));
+  await pruneSelectionContexts(directory);
   return file;
+}
+
+async function pruneSelectionContexts(directory) {
+  const entries = await vscode.workspace.fs.readDirectory(directory);
+  const snapshots = entries
+    .filter(([name, type]) =>
+      type === vscode.FileType.File && name.startsWith("selection-") && name.endsWith(".md"),
+    )
+    .map(([name]) => name)
+    .sort()
+    .reverse();
+
+  await Promise.all(
+    snapshots.slice(MAX_SELECTION_SNAPSHOTS).map((name) =>
+      vscode.workspace.fs.delete(vscode.Uri.joinPath(directory, name), { useTrash: false }),
+    ),
+  );
 }
 
 function openJcodeTerminal(editor = getCurrentTextEditor()) {

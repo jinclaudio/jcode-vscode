@@ -39,11 +39,13 @@ async function run() {
     fakeJcode,
     [
       "#!/usr/bin/env python3",
-      "import json, sys",
+      "import json, sys, time",
       "args = sys.argv[1:]",
       `open(${JSON.stringify(argsLog)}, 'a').write('\\0'.join(args) + '\\n')`,
       "if 'run' in args:",
       "    prompt = args[-1]",
+      "    if 'WAIT_FOR_CANCEL' in prompt:",
+      "        time.sleep(30)",
       "    print(json.dumps({'session_id': 'fake-session-1', 'provider': 'test-provider', 'model': 'test-model', 'text': 'FAKE_CHAT_RESPONSE: ' + prompt[:80]}))",
       "    sys.exit(0)",
       "for _line in sys.stdin:",
@@ -67,6 +69,8 @@ async function run() {
     "jcode.fixSelection",
     "jcode._test.sendChat",
     "jcode._test.newChat",
+    "jcode._test.cancelChat",
+    "jcode._test.captureSelection",
   ]) {
     assert.ok(commands.includes(command), `${command} must be registered`);
   }
@@ -119,6 +123,17 @@ async function run() {
   assert.match(contextText, /- Dirty: true/);
   assert.match(contextText, /Selection 1 \(L1:C7-L1:C12\)[\s\S]*alpha/);
   assert.match(contextText, /Selection 2 \(L2:C7-L2:C11\)[\s\S]*beta/);
+
+  let lastSnapshot;
+  for (let index = 0; index < 25; index += 1) {
+    lastSnapshot = await vscode.commands.executeCommand("jcode._test.captureSelection");
+  }
+  const snapshotDirectory = vscode.Uri.file(path.dirname(lastSnapshot.contextFile.fsPath));
+  const snapshots = (await vscode.workspace.fs.readDirectory(snapshotDirectory))
+    .filter(([name, type]) =>
+      type === vscode.FileType.File && name.startsWith("selection-") && name.endsWith(".md"),
+    );
+  assert.equal(snapshots.length, 20, "temporary selection snapshots must be bounded");
 
   editor.selections = [new vscode.Selection(0, 0, 0, 0)];
   const secondResult = await vscode.commands.executeCommand(
@@ -199,6 +214,26 @@ async function run() {
     assert.equal(await fs.readlink(`/proc/${realPid}/cwd`), scratch);
   }
   realTerminal.dispose();
+
+  await updateSetting("executablePath", fakeJcode);
+  await updateSetting("launchArguments", []);
+  const cancellation = vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "WAIT_FOR_CANCEL",
+    false,
+  );
+  await waitFor(async () => {
+    const current = await readInvocations(argsLog);
+    return current.some((args) => args.at(-1) === "WAIT_FOR_CANCEL");
+  }, "cancellable chat process to start");
+  await vscode.commands.executeCommand("jcode._test.cancelChat");
+  assert.equal(await cancellation, undefined);
+  const afterCancellation = await vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "Chat remains usable after cancellation.",
+    false,
+  );
+  assert.match(afterCancellation.text, /FAKE_CHAT_RESPONSE/);
 
   await updateSetting("executablePath", undefined);
   await updateSetting("launchArguments", undefined);
