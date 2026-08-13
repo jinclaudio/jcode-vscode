@@ -31,8 +31,28 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.3.0";
+const CLIENT_NAME = "jcode-vscode/0.4.0";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_ATTACHMENTS = 10;
+const IMAGE_MEDIA_TYPES = new Map([
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".webp", "image/webp"],
+  [".gif", "image/gif"],
+]);
+const SLASH_COMMANDS = [
+  { name: "/help", description: "Show commands available in the VS Code chat" },
+  { name: "/model", description: "List or switch models", usage: "/model [name]" },
+  { name: "/models", description: "Alias for /model", usage: "/models [name]" },
+  { name: "/effort", description: "Show or set reasoning effort", usage: "/effort [level]" },
+  { name: "/clear", description: "Clear conversation history" },
+  { name: "/compact", description: "Compact the current session context" },
+  { name: "/rename", description: "Rename the current session", usage: "/rename <title>" },
+  { name: "/info", description: "Show session, provider, model, and runtime info" },
+  { name: "/cancel", description: "Cancel the current response" },
+];
 
 let jcodeTerminal;
 let lastTextEditor;
@@ -188,8 +208,11 @@ function activate(context) {
 
   if (context.extensionMode === vscode.ExtensionMode.Test) {
     context.subscriptions.push(
-      vscode.commands.registerCommand("jcode._test.sendChat", (text, includeSelection = true) =>
-        chatProvider.sendMessage(text, includeSelection),
+      vscode.commands.registerCommand("jcode._test.sendChat", (text, includeSelection = true, options = {}) =>
+        chatProvider.sendMessage(text, includeSelection, undefined, options),
+      ),
+      vscode.commands.registerCommand("jcode._test.addPastedImage", (mediaType, data, name) =>
+        chatProvider.addPastedImage({ mediaType, data, name }),
       ),
       vscode.commands.registerCommand("jcode._test.newChat", () => chatProvider.newChat()),
       vscode.commands.registerCommand("jcode._test.cancelChat", () => chatProvider.cancel()),
@@ -217,6 +240,8 @@ class JcodeChatViewProvider {
     this.sessionId = undefined;
     this.modelWatcher = undefined;
     this.disposed = false;
+    this.attachments = new Map();
+    this.nextAttachmentId = 1;
   }
 
   resolveWebviewView(webviewView) {
@@ -233,7 +258,17 @@ class JcodeChatViewProvider {
           await this.sendMessage(message.text, message.includeSelection !== false, undefined, {
             model: message.model,
             effort: message.effort,
+            attachmentIds: message.attachmentIds,
           });
+          break;
+        case "chooseAttachments":
+          await this.chooseAttachments();
+          break;
+        case "addPastedImage":
+          await this.addPastedImage(message);
+          break;
+        case "removeAttachment":
+          this.removeAttachment(message.id);
           break;
         case "cancel":
           await this.cancel();
@@ -398,8 +433,73 @@ class JcodeChatViewProvider {
       model: this.getSelectedModel() || current || "",
       effortLevels: EFFORT_LEVELS,
       effort: this.getSelectedEffort(),
+      slashCommands: SLASH_COMMANDS,
+      attachments: [...this.attachments.values()].map(publicAttachment),
       error,
     });
+  }
+
+  async chooseAttachments() {
+    const remaining = MAX_ATTACHMENTS - this.attachments.size;
+    if (remaining <= 0) {
+      this.post({ type: "notice", text: `You can attach up to ${MAX_ATTACHMENTS} files.` });
+      return;
+    }
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: true,
+      openLabel: "Attach to Jcode",
+    });
+    if (!uris) return;
+    for (const uri of uris.slice(0, remaining)) {
+      try {
+        const stat = await vscode.workspace.fs.stat(uri);
+        if (stat.size > MAX_ATTACHMENT_BYTES) {
+          this.post({ type: "notice", text: `${path.basename(uri.fsPath)} is larger than 20 MB and was not attached.` });
+          continue;
+        }
+        const extension = path.extname(uri.fsPath).toLowerCase();
+        const attachment = {
+          id: `file-${this.nextAttachmentId++}`,
+          name: path.basename(uri.fsPath),
+          size: stat.size,
+          kind: IMAGE_MEDIA_TYPES.has(extension) ? "image" : "file",
+          mediaType: IMAGE_MEDIA_TYPES.get(extension),
+          uri,
+        };
+        this.attachments.set(attachment.id, attachment);
+      } catch (error) {
+        this.post({ type: "notice", text: `Could not attach ${path.basename(uri.fsPath)}: ${errorMessage(error)}` });
+      }
+    }
+    this.post({ type: "attachments", attachments: [...this.attachments.values()].map(publicAttachment) });
+  }
+
+  async addPastedImage(message) {
+    if (this.attachments.size >= MAX_ATTACHMENTS) return;
+    const mediaType = typeof message.mediaType === "string" ? message.mediaType : "";
+    const data = typeof message.data === "string" ? message.data : "";
+    if (!mediaType.startsWith("image/") || !data || Buffer.byteLength(data, "base64") > MAX_ATTACHMENT_BYTES) {
+      this.post({ type: "notice", text: "The pasted image could not be attached or exceeds 20 MB." });
+      return;
+    }
+    const attachment = {
+      id: `paste-${this.nextAttachmentId++}`,
+      name: typeof message.name === "string" && message.name ? message.name : "Pasted image",
+      size: Buffer.byteLength(data, "base64"),
+      kind: "image",
+      mediaType,
+      data,
+    };
+    this.attachments.set(attachment.id, attachment);
+    this.post({ type: "attachments", attachments: [...this.attachments.values()].map(publicAttachment) });
+    return attachment.id;
+  }
+
+  removeAttachment(id) {
+    if (typeof id === "string") this.attachments.delete(id);
+    this.post({ type: "attachments", attachments: [...this.attachments.values()].map(publicAttachment) });
   }
 
   watchModel(client) {
@@ -437,8 +537,25 @@ class JcodeChatViewProvider {
   }
 
   async sendMessage(text, includeSelection = true, explicitSelection, options = {}) {
-    const instruction = typeof text === "string" ? text.trim() : "";
+    let instruction = typeof text === "string" ? text.trim() : "";
     if (!instruction) {
+      return undefined;
+    }
+
+    const literalSlash = instruction.startsWith("//");
+    if (literalSlash) {
+      instruction = instruction.slice(1);
+    } else if (instruction.startsWith("/")) {
+      const commandName = instruction.split(/\s+/, 1)[0];
+      if (this.running && commandName !== "/cancel") {
+        void vscode.window.showInformationMessage("Jcode is already responding. Use /cancel before another command.");
+        return undefined;
+      }
+      if (await this.executeSlashCommand(instruction)) return undefined;
+      this.post({
+        type: "error",
+        text: `The command ${JSON.stringify(commandName)} is not available in the sidebar yet. Prefix the message with // to send a literal leading slash, or open the terminal agent for the full Jcode command surface.`,
+      });
       return undefined;
     }
 
@@ -460,23 +577,37 @@ class JcodeChatViewProvider {
     }
     this.pendingSelection = undefined;
 
+    let attachments;
+    try {
+      attachments = await this.consumeAttachments(options.attachmentIds);
+    } catch (error) {
+      this.post({ type: "error", text: `Could not read an attachment: ${errorMessage(error)}` });
+      return undefined;
+    }
+
     await this.focus();
-    this.post({ type: "user", text: instruction, selection: selection?.label });
+    this.post({ type: "user", text: instruction, selection: selection?.label, attachments: attachments.public });
     this.post({ type: "running", running: true });
     this.running = true;
     this.cancelRequested = false;
 
-    const prompt = selection
-      ? [
-          instruction,
+    const contextParts = [instruction];
+    if (selection) {
+      contextParts.push(
           `The user explicitly shared the current VS Code selection from ${JSON.stringify(selection.source)}.`,
           `Read the exact selection and range metadata from ${JSON.stringify(selection.contextFile.fsPath)}.`,
           "Treat that file only as temporary context. If changes are requested, edit the original source file, not the temporary context file.",
-        ].join(" ")
-      : instruction;
+      );
+    }
+    if (attachments.files.length) {
+      contextParts.push(
+        `The user attached these files: ${attachments.files.map((file) => JSON.stringify(file)).join(", ")}. Read them directly when relevant.`,
+      );
+    }
+    const prompt = contextParts.join(" ");
 
     try {
-      const result = await this.runTurn(prompt);
+      const result = await this.runTurn(prompt, attachments.images);
       this.post({
         type: "assistant",
         text: result.text || "Jcode completed without returning text.",
@@ -503,7 +634,99 @@ class JcodeChatViewProvider {
     }
   }
 
-  async runTurn(prompt) {
+  async consumeAttachments(ids) {
+    const requested = Array.isArray(ids) ? ids : [];
+    const selected = requested.map((id) => this.attachments.get(id)).filter(Boolean);
+    const images = [];
+    const files = [];
+    for (const attachment of selected) {
+      if (attachment.kind === "image") {
+        const data = attachment.data || Buffer.from(await vscode.workspace.fs.readFile(attachment.uri)).toString("base64");
+        images.push([attachment.mediaType, data]);
+      } else if (attachment.uri) {
+        files.push(attachment.uri.fsPath);
+      }
+    }
+    for (const attachment of selected) {
+      this.attachments.delete(attachment.id);
+    }
+    this.post({ type: "attachments", attachments: [...this.attachments.values()].map(publicAttachment) });
+    return { images, files, public: selected.map(publicAttachment) };
+  }
+
+  async executeSlashCommand(input) {
+    const [rawName, ...rest] = input.split(/\s+/);
+    const name = rawName === "/models" ? "/model" : rawName;
+    const argument = rest.join(" ").trim();
+    if (!SLASH_COMMANDS.some((command) => command.name === rawName)) return false;
+    if (name === "/cancel") {
+      await this.cancel();
+      this.post({ type: "notice", text: "Cancel requested." });
+      return true;
+    }
+    if (name === "/help") {
+      this.post({ type: "commandHelp", commands: SLASH_COMMANDS });
+      return true;
+    }
+    if (name === "/model") {
+      if (!argument) {
+        try {
+          const client = await this.ensureSession();
+          const catalog = await client.listModels(this.sessionId);
+          this.post({
+            type: "commandInfo",
+            title: "Available models",
+            rows: catalog.models.map((model) => [model === catalog.current ? "current" : "model", model]),
+          });
+          this.post({ type: "openModelPicker" });
+        } catch (error) {
+          this.post({ type: "error", text: `/model failed: ${errorMessage(error)}` });
+        }
+      } else await this.setSelectedModel(argument);
+      return true;
+    }
+    if (name === "/effort") {
+      if (!argument) this.post({ type: "openEffortPicker" });
+      else if (EFFORT_LEVELS.includes(argument)) await this.setSelectedEffort(argument);
+      else this.post({ type: "error", text: `Unknown effort ${JSON.stringify(argument)}. Use: ${EFFORT_LEVELS.join(", ")}.` });
+      return true;
+    }
+    try {
+      const client = await this.ensureSession();
+      if (name === "/clear") {
+        await client.clear(this.sessionId);
+        this.attachments.clear();
+        this.post({ type: "cleared" });
+        this.post({ type: "notice", text: "Conversation history cleared." });
+      } else if (name === "/compact") {
+        await client.compact(this.sessionId);
+        this.post({ type: "notice", text: "Context compaction scheduled." });
+      } else if (name === "/rename") {
+        if (!argument) this.post({ type: "error", text: "Usage: /rename <title>" });
+        else {
+          await client.renameSession(this.sessionId, argument);
+          this.post({ type: "notice", text: `Session renamed to ${argument}.` });
+        }
+      } else if (name === "/info") {
+        const runtime = await client.getRuntimeInfo(this.sessionId);
+        this.post({
+          type: "commandInfo",
+          title: "Session info",
+          rows: [
+            ["Session", this.sessionId],
+            ["Provider", runtime.provider || "auto"],
+            ["Model", runtime.model || this.getSelectedModel() || "auto"],
+            ["Server", runtime.server || "Jcode"],
+          ],
+        });
+      }
+    } catch (error) {
+      this.post({ type: "error", text: `${name} failed: ${errorMessage(error)}` });
+    }
+    return true;
+  }
+
+  async runTurn(prompt, images = []) {
     const client = await this.ensureSession();
     const sessionId = this.sessionId;
     let provider;
@@ -516,6 +739,7 @@ class JcodeChatViewProvider {
       // Runtime info is best-effort; the turn can still run without it.
     }
     const result = await client.run(sessionId, prompt, {
+      images,
       autoApprove: true,
       onEvent: (event) => {
         if (event.ev === "text_delta") {
@@ -556,6 +780,7 @@ class JcodeChatViewProvider {
       }
     }
     this.pendingSelection = undefined;
+    this.attachments.clear();
     this.sessionId = undefined;
     await this.context.workspaceState.update(CHAT_SESSION_KEY, undefined);
     this.post({ type: "cleared" });
@@ -574,6 +799,15 @@ class JcodeChatViewProvider {
     this.disposed = true;
     void this.cancel();
   }
+}
+
+function publicAttachment(attachment) {
+  return {
+    id: attachment.id,
+    name: attachment.name,
+    size: attachment.size,
+    kind: attachment.kind,
+  };
 }
 
 async function captureSelectionContext(context, warnWhenMissing) {
@@ -747,189 +981,141 @@ function getChatHtml(webview) {
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
   <title>Jcode Chat</title>
   <style>
-    :root { color-scheme: light dark; }
+    :root { color-scheme: light dark; --accent: #d97757; --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent); }
     * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      height: 100vh;
-      overflow: hidden;
-      color: var(--vscode-foreground);
-      background: var(--vscode-sideBar-background);
-      font: 13px/1.45 var(--vscode-font-family);
-    }
-    button, textarea { font: inherit; }
-    button:focus-visible, textarea:focus-visible, input:focus-visible {
-      outline: 1px solid var(--vscode-focusBorder);
-      outline-offset: 2px;
-    }
-    .app { display: flex; flex-direction: column; height: 100%; min-width: 220px; }
-    .toolbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      min-height: 38px;
-      padding: 5px 8px 5px 12px;
-      border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, var(--vscode-panel-border));
-    }
-    .brand { display: flex; align-items: center; gap: 7px; font-weight: 600; }
-    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--vscode-testing-iconPassed); }
-    .toolbar-actions { display: flex; gap: 2px; }
-    .btn {
-      border: 0;
-      border-radius: 5px;
-      min-height: 28px;
-      padding: 4px 9px;
-      color: var(--vscode-button-foreground);
-      background: var(--vscode-button-background);
-      cursor: pointer;
-    }
-    .btn:hover { background: var(--vscode-button-hoverBackground); }
-    .btn:active { transform: translateY(1px); }
-    .btn:disabled { cursor: default; opacity: .55; transform: none; }
-    .btn-ghost { color: var(--vscode-foreground); background: transparent; }
-    .btn-ghost:hover { background: var(--vscode-toolbar-hoverBackground); }
-    .btn-square { width: 28px; padding: 0; }
-    .messages {
-      flex: 1;
-      overflow-y: auto;
-      padding: 14px 12px 20px;
-      scroll-padding-bottom: 16px;
-    }
-    .empty { max-width: 31ch; margin: 18vh auto 0; color: var(--vscode-descriptionForeground); text-align: center; }
-    .empty-mark {
-      display: grid;
-      place-items: center;
-      width: 34px;
-      height: 34px;
-      margin: 0 auto 12px;
-      border: 1px solid var(--vscode-widget-border);
-      border-radius: 9px;
-      color: var(--vscode-textLink-foreground);
-      font-size: 18px;
-    }
-    .empty strong { display: block; margin-bottom: 4px; color: var(--vscode-foreground); font-size: 14px; }
-    .chat { display: flex; flex-direction: column; margin: 0 0 16px; }
-    .chat-start { align-items: flex-start; }
-    .chat-end { align-items: flex-end; }
-    .chat-header { margin: 0 6px 5px; color: var(--vscode-descriptionForeground); font-size: 11px; }
-    .chat-bubble {
-      max-width: min(100%, 72ch);
-      padding: 9px 10px;
-      border-radius: 9px;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      user-select: text;
-    }
-    .chat-start .chat-bubble { background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-widget-border); }
-    .chat-end .chat-bubble { color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, transparent); }
-    .chat-footer { margin: 5px 6px 0; color: var(--vscode-descriptionForeground); font-size: 11px; }
-    .notice { margin: 10px 0; color: var(--vscode-descriptionForeground); font-size: 12px; text-align: center; }
-    .error { color: var(--vscode-errorForeground); }
-    .typing { display: flex; gap: 4px; align-items: center; min-height: 39px; }
-    .typing i { width: 5px; height: 5px; border-radius: 50%; background: var(--vscode-descriptionForeground); animation: pulse 1.2s infinite; }
+    body { margin: 0; height: 100vh; overflow: hidden; color: var(--vscode-foreground); background: var(--vscode-sideBar-background); font: 13px/1.5 var(--vscode-font-family); }
+    button, textarea, input, select { font: inherit; }
+    button, input, select, textarea { color: inherit; }
+    button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
+    .app { display: flex; flex-direction: column; height: 100%; min-width: 230px; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; min-height: 42px; padding: 7px 8px 7px 12px; border-bottom: 1px solid var(--vscode-panel-border); }
+    .brand { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 600; }
+    .brand-mark { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; color: #fff; background: var(--accent); font-weight: 700; font-size: 12px; }
+    .brand-copy { display: flex; flex-direction: column; min-width: 0; line-height: 1.1; }
+    .brand-copy small { color: var(--vscode-descriptionForeground); font-size: 10px; font-weight: 400; }
+    .top-actions { display: flex; gap: 2px; }
+    .icon-btn { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 6px; color: var(--vscode-icon-foreground); background: transparent; cursor: pointer; }
+    .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
+    .icon-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+    .messages { flex: 1; overflow-y: auto; padding: 14px 12px 24px; scroll-padding-bottom: 24px; }
+    .welcome { max-width: 420px; margin: max(38px, 10vh) auto 0; }
+    .welcome-mark { display: grid; place-items: center; width: 36px; height: 36px; margin-bottom: 15px; border-radius: 10px; color: #fff; background: var(--accent); font-size: 19px; }
+    .welcome h1 { margin: 0 0 6px; font-size: 19px; line-height: 1.25; font-weight: 600; letter-spacing: -.2px; }
+    .welcome p { margin: 0 0 18px; color: var(--vscode-descriptionForeground); }
+    .starters { display: grid; gap: 7px; }
+    .starter { display: flex; align-items: center; gap: 9px; width: 100%; padding: 9px 10px; border: 1px solid var(--vscode-widget-border); border-radius: 9px; color: var(--vscode-foreground); background: color-mix(in srgb, var(--vscode-editorWidget-background) 58%, transparent); text-align: left; cursor: pointer; }
+    .starter:hover { border-color: color-mix(in srgb, var(--accent) 48%, var(--vscode-widget-border)); background: var(--accent-soft); }
+    .starter-icon { color: var(--accent); font-size: 15px; }
+    .chat { margin: 0 auto 18px; max-width: 760px; }
+    .chat-header { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; color: var(--vscode-descriptionForeground); font-size: 11px; font-weight: 500; }
+    .avatar { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 6px; color: #fff; background: var(--accent); font-size: 10px; font-weight: 700; }
+    .chat-user .avatar { color: var(--vscode-foreground); background: var(--vscode-badge-background); }
+    .chat-bubble { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+    .chat-user .chat-bubble { padding: 10px 11px; border: 1px solid var(--vscode-widget-border); border-radius: 10px; background: color-mix(in srgb, var(--vscode-editorWidget-background) 78%, transparent); }
+    .chat-assistant .chat-bubble { padding: 1px 2px; }
+    .chat-footer { margin-top: 7px; color: var(--vscode-descriptionForeground); font-size: 10px; }
+    .message-attachments { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 7px; }
+    .message-file { display: inline-flex; align-items: center; gap: 5px; max-width: 210px; padding: 4px 7px; border: 1px solid var(--vscode-widget-border); border-radius: 6px; color: var(--vscode-descriptionForeground); background: var(--vscode-editorWidget-background); font-size: 10px; }
+    .message-file span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .notice { max-width: 680px; margin: 12px auto; padding: 7px 9px; border-radius: 7px; color: var(--vscode-descriptionForeground); background: color-mix(in srgb, var(--vscode-editorWidget-background) 65%, transparent); font-size: 11px; text-align: center; }
+    .notice.error { color: var(--vscode-errorForeground); background: color-mix(in srgb, var(--vscode-inputValidation-errorBackground) 60%, transparent); }
+    .command-card { max-width: 680px; margin: 12px auto; overflow: hidden; border: 1px solid var(--vscode-widget-border); border-radius: 9px; background: var(--vscode-editorWidget-background); }
+    .command-title { padding: 8px 10px; border-bottom: 1px solid var(--vscode-widget-border); font-weight: 600; }
+    .command-row { display: grid; grid-template-columns: minmax(74px, auto) 1fr; gap: 10px; padding: 6px 10px; border-bottom: 1px solid color-mix(in srgb, var(--vscode-widget-border) 55%, transparent); font-size: 11px; }
+    .command-row:last-child { border-bottom: 0; }
+    .command-row code { color: var(--accent); font-family: var(--vscode-editor-font-family); }
+    .command-row span:last-child { color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
+    .typing { display: inline-flex; gap: 4px; align-items: center; min-height: 24px; }
+    .typing i { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); animation: pulse 1.2s infinite; }
     .typing i:nth-child(2) { animation-delay: .16s; }
     .typing i:nth-child(3) { animation-delay: .32s; }
-    @keyframes pulse { 0%, 60%, 100% { opacity: .35; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
-    .composer-wrap { padding: 8px; border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
-    .selection {
-      display: none;
-      margin: 0 1px 7px;
-      padding: 5px 7px;
-      border-radius: 5px;
-      color: var(--vscode-descriptionForeground);
-      background: var(--vscode-editor-inactiveSelectionBackground);
-      font-size: 11px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .selection.visible { display: block; }
-    .composer {
-      border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
-      border-radius: 9px;
-      background: var(--vscode-input-background);
-      overflow: hidden;
-    }
-    .textarea {
-      display: block;
-      width: 100%;
-      min-height: 66px;
-      max-height: 180px;
-      resize: none;
-      border: 0;
-      outline: 0;
-      padding: 9px 10px 4px;
-      color: var(--vscode-input-foreground);
-      background: transparent;
-    }
-    .textarea::placeholder { color: var(--vscode-input-placeholderForeground); opacity: 1; }
-    .model-row { display: flex; align-items: center; gap: 6px; padding: 0 6px 6px 9px; }
-    .model-input {
-      flex: 1;
-      min-width: 0;
-      border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
-      border-radius: 5px;
-      padding: 3px 7px;
-      color: var(--vscode-input-foreground);
-      background: var(--vscode-input-background);
-      font-size: 11px;
-    }
-    .model-input::placeholder { color: var(--vscode-input-placeholderForeground); opacity: 1; }
-    .effort-select {
-      max-width: 116px;
-      border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
-      border-radius: 5px;
-      padding: 3px 4px;
-      color: var(--vscode-input-foreground);
-      background: var(--vscode-input-background);
-      font-size: 11px;
-    }
-    .composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 6px 6px 9px; }
-    .context-toggle { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--vscode-descriptionForeground); font-size: 11px; }
-    .context-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .send-actions { display: flex; gap: 4px; }
-    #cancel { display: none; }
+    @keyframes pulse { 0%, 60%, 100% { opacity: .3; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
+    .composer-zone { position: relative; padding: 0 8px 9px; background: linear-gradient(transparent, var(--vscode-sideBar-background) 14px); }
+    .selection-chip { display: none; align-items: center; gap: 6px; max-width: 100%; margin: 0 4px 6px; padding: 4px 8px; border-radius: 6px; color: var(--vscode-descriptionForeground); background: var(--vscode-editor-inactiveSelectionBackground); font-size: 10px; }
+    .selection-chip.visible { display: flex; }
+    .selection-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .composer { position: relative; border: 1px solid var(--vscode-input-border, var(--vscode-widget-border)); border-radius: 12px; background: var(--vscode-input-background); box-shadow: 0 4px 18px rgba(0,0,0,.10); }
+    .composer:focus-within { border-color: color-mix(in srgb, var(--accent) 62%, var(--vscode-focusBorder)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 20%, transparent), 0 5px 22px rgba(0,0,0,.14); }
+    .pending-attachments { display: none; flex-wrap: wrap; gap: 6px; padding: 8px 8px 0; }
+    .pending-attachments.visible { display: flex; }
+    .attachment-chip { display: flex; align-items: center; gap: 6px; min-width: 0; max-width: 190px; padding: 5px 6px 5px 8px; border: 1px solid var(--vscode-widget-border); border-radius: 7px; background: var(--vscode-editorWidget-background); font-size: 10px; }
+    .attachment-chip .attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .attachment-chip .attachment-kind { color: var(--accent); }
+    .attachment-remove { display: grid; place-items: center; width: 16px; height: 16px; padding: 0; border: 0; border-radius: 4px; color: var(--vscode-descriptionForeground); background: transparent; cursor: pointer; }
+    .attachment-remove:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
+    .prompt { display: block; width: 100%; min-height: 62px; max-height: 200px; resize: none; border: 0; outline: 0; padding: 10px 11px 4px; color: var(--vscode-input-foreground); background: transparent; line-height: 1.45; }
+    .prompt::placeholder { color: var(--vscode-input-placeholderForeground); opacity: 1; }
+    .composer-tools { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 5px 6px 6px; }
+    .tool-left, .tool-right { display: flex; align-items: center; gap: 3px; min-width: 0; }
+    .small-btn { display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 26px; padding: 0 7px; border: 0; border-radius: 6px; color: var(--vscode-descriptionForeground); background: transparent; font-size: 10px; cursor: pointer; }
+    .small-btn:hover, .small-btn.active { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
+    .small-btn.active { color: var(--accent); }
+    .small-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    .model-input, .effort-select { height: 26px; border: 0; border-radius: 6px; color: var(--vscode-descriptionForeground); background: transparent; font-size: 10px; }
+    .model-input { width: min(128px, 34vw); padding: 0 7px; }
+    .model-input:hover, .model-input:focus, .effort-select:hover, .effort-select:focus { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); outline: 0; }
+    .effort-select { max-width: 82px; padding: 0 3px; }
+    .send-btn { display: grid; place-items: center; width: 27px; height: 27px; padding: 0; border: 0; border-radius: 7px; color: #fff; background: var(--accent); cursor: pointer; }
+    .send-btn:hover { filter: brightness(1.08); }
+    .send-btn:disabled { opacity: .45; cursor: default; }
+    .send-btn svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    #cancel { display: none; background: var(--vscode-errorForeground); }
     body.running #send { display: none; }
-    body.running #cancel { display: inline-block; }
+    body.running #cancel { display: grid; }
+    .slash-menu { display: none; position: absolute; left: 12px; right: 12px; bottom: calc(100% - 4px); z-index: 10; max-height: min(320px, 48vh); overflow-y: auto; padding: 5px; border: 1px solid var(--vscode-widget-border); border-radius: 10px; background: var(--vscode-editorWidget-background); box-shadow: 0 8px 30px rgba(0,0,0,.28); }
+    .slash-menu.visible { display: block; }
+    .slash-item { display: grid; grid-template-columns: minmax(76px, auto) 1fr; gap: 10px; width: 100%; padding: 7px 8px; border: 0; border-radius: 6px; color: var(--vscode-foreground); background: transparent; text-align: left; cursor: pointer; }
+    .slash-item:hover, .slash-item.selected { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+    .slash-item code { font-family: var(--vscode-editor-font-family); font-size: 11px; font-weight: 600; }
+    .slash-item span { color: var(--vscode-descriptionForeground); font-size: 10px; }
+    .slash-item.selected span { color: inherit; opacity: .8; }
+    .composer-hint { margin: 5px 4px 0; color: var(--vscode-descriptionForeground); font-size: 9px; text-align: center; }
+    @media (max-width: 300px) { .model-input { width: 80px; } .small-btn span { display: none; } }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; } }
   </style>
 </head>
 <body>
   <main class="app">
-    <header class="toolbar">
-      <div class="brand"><span class="status-dot" aria-hidden="true"></span><span>Jcode</span></div>
-      <div class="toolbar-actions">
-        <button id="terminal" class="btn btn-ghost btn-square" title="Open terminal agent" aria-label="Open terminal agent">›_</button>
-        <button id="new-chat" class="btn btn-ghost" title="Start a new chat">New</button>
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">J</span><span class="brand-copy"><span>Jcode</span><small id="session-status">Connecting…</small></span></div>
+      <div class="top-actions">
+        <button id="terminal" class="icon-btn" title="Open terminal agent" aria-label="Open terminal agent"><svg viewBox="0 0 24 24"><path d="m5 7 4 4-4 4M11 17h7"/></svg></button>
+        <button id="new-chat" class="icon-btn" title="New chat" aria-label="New chat"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
       </div>
     </header>
     <section id="messages" class="messages" aria-live="polite">
-      <div id="empty" class="empty">
-        <div class="empty-mark" aria-hidden="true">✦</div>
-        <strong>Work with Jcode</strong>
-        Ask about your project, or select code and press <span id="shortcut">Ctrl+Shift+J</span>.
+      <div id="empty" class="welcome">
+        <div class="welcome-mark">✦</div>
+        <h1>What can I help you build?</h1>
+        <p>Jcode can inspect your workspace, edit files, run commands, and validate the result.</p>
+        <div class="starters">
+          <button class="starter" data-prompt="Review this project and identify the highest-impact improvement."><span class="starter-icon">⌁</span><span>Review this project</span></button>
+          <button class="starter" data-prompt="Find and fix a bug in this workspace. Validate the fix."><span class="starter-icon">◇</span><span>Find and fix a bug</span></button>
+          <button class="starter" data-prompt="Explain the architecture of this codebase and its main data flow."><span class="starter-icon">◎</span><span>Explain the architecture</span></button>
+        </div>
       </div>
     </section>
-    <footer class="composer-wrap">
-      <div id="selection" class="selection" title=""></div>
+    <footer class="composer-zone">
+      <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash commands"></div>
+      <div id="selection" class="selection-chip" title=""><span>⌁</span><span id="selection-label"></span></div>
       <div class="composer">
-        <textarea id="prompt" class="textarea" rows="3" aria-label="Message Jcode" placeholder="Ask Jcode about this workspace…"></textarea>
-        <div class="model-row">
-          <input id="model" class="model-input" list="model-suggestions" autocomplete="off" spellcheck="false" placeholder="Model (auto)" aria-label="Model" title="Model. Type any name or pick a suggestion; empty uses Jcode's default.">
-          <datalist id="model-suggestions"></datalist>
-          <select id="effort" class="effort-select" aria-label="Reasoning effort" title="Reasoning effort. Empty uses Jcode's default; accepted levels depend on the provider."></select>
-        </div>
-        <div class="composer-footer">
-          <label class="context-toggle" title="Attach the current editor selection when available">
-            <input id="include-selection" type="checkbox" checked>
-            <span>Include selection</span>
-          </label>
-          <div class="send-actions">
-            <button id="cancel" class="btn btn-ghost" type="button">Cancel</button>
-            <button id="send" class="btn" type="button">Send</button>
+        <div id="attachments" class="pending-attachments"></div>
+        <textarea id="prompt" class="prompt" rows="3" aria-label="Message Jcode" placeholder="Ask Jcode… Type / for commands"></textarea>
+        <div class="composer-tools">
+          <div class="tool-left">
+            <button id="attach" class="small-btn" type="button" title="Attach files or images"><svg viewBox="0 0 24 24"><path d="M12 17V7a4 4 0 0 1 8 0v9a7 7 0 0 1-14 0V6a2 2 0 0 1 4 0v10a3 3 0 0 0 6 0V8"/></svg><span>Attach</span></button>
+            <button id="selection-toggle" class="small-btn active" type="button" title="Include current editor selection"><svg viewBox="0 0 24 24"><path d="M8 5H5v3M16 5h3v3M8 19H5v-3M16 19h3v-3M9 9h6v6H9z"/></svg><span>Selection</span></button>
+          </div>
+          <div class="tool-right">
+            <input id="model" class="model-input" list="model-suggestions" autocomplete="off" spellcheck="false" placeholder="Model: auto" aria-label="Model">
+            <datalist id="model-suggestions"></datalist>
+            <select id="effort" class="effort-select" aria-label="Reasoning effort"></select>
+            <button id="cancel" class="send-btn" type="button" title="Cancel response" aria-label="Cancel response"><svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1"/></svg></button>
+            <button id="send" class="send-btn" type="button" title="Send message" aria-label="Send message"><svg viewBox="0 0 24 24"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5"/></svg></button>
           </div>
         </div>
       </div>
+      <div class="composer-hint">Enter to send · Shift+Enter for a new line · paste images directly</div>
     </footer>
   </main>
   <script nonce="${nonce}">
@@ -938,38 +1124,73 @@ function getChatHtml(webview) {
     const empty = document.getElementById("empty");
     const prompt = document.getElementById("prompt");
     const selection = document.getElementById("selection");
-    const includeSelection = document.getElementById("include-selection");
+    const selectionLabel = document.getElementById("selection-label");
+    const selectionToggle = document.getElementById("selection-toggle");
+    const attachmentList = document.getElementById("attachments");
+    const slashMenu = document.getElementById("slash-menu");
     const modelInput = document.getElementById("model");
     const modelSuggestions = document.getElementById("model-suggestions");
     const effortSelect = document.getElementById("effort");
     const saved = vscode.getState() || { messages: [] };
-    let liveBubble = undefined;
-
-    if (navigator.platform.includes("Mac")) {
-      document.getElementById("shortcut").textContent = "Cmd+Shift+J";
-    }
+    let liveBubble;
+    let attachments = [];
+    let slashCommands = [];
+    let slashMatches = [];
+    let slashIndex = 0;
+    let includeSelection = true;
 
     function persist() {
-      const items = [...messages.querySelectorAll(".chat[data-role]")].map((item) => ({
-        role: item.dataset.role,
-        text: item.querySelector(".chat-bubble").textContent,
-        meta: item.querySelector(".chat-footer")?.textContent || "",
-      }));
+      const items = [...messages.querySelectorAll(".chat[data-role]")].map(function (item) {
+        return {
+          role: item.dataset.role,
+          text: item.querySelector(".chat-bubble").textContent,
+          meta: item.querySelector(".chat-footer")?.textContent || "",
+          attachments: JSON.parse(item.dataset.attachments || "[]"),
+        };
+      });
       vscode.setState({ messages: items });
     }
 
-    function appendMessage(role, text, meta = "") {
+    function attachmentIcon(kind) { return kind === "image" ? "▧" : "▤"; }
+
+    function createMessageAttachments(items) {
+      if (!items || !items.length) return undefined;
+      const wrap = document.createElement("div");
+      wrap.className = "message-attachments";
+      items.forEach(function (file) {
+        const chip = document.createElement("div");
+        chip.className = "message-file";
+        const icon = document.createElement("b");
+        icon.textContent = attachmentIcon(file.kind);
+        const name = document.createElement("span");
+        name.textContent = file.name;
+        chip.append(icon, name);
+        wrap.append(chip);
+      });
+      return wrap;
+    }
+
+    function appendMessage(role, text, meta, files) {
       empty.hidden = true;
       const item = document.createElement("article");
-      item.className = "chat " + (role === "user" ? "chat-end" : "chat-start");
+      item.className = "chat " + (role === "user" ? "chat-user" : "chat-assistant");
       item.dataset.role = role;
+      item.dataset.attachments = JSON.stringify(files || []);
       const header = document.createElement("div");
       header.className = "chat-header";
-      header.textContent = role === "user" ? "You" : "Jcode";
+      const avatar = document.createElement("span");
+      avatar.className = "avatar";
+      avatar.textContent = role === "user" ? "Y" : "J";
+      const label = document.createElement("span");
+      label.textContent = role === "user" ? "You" : "Jcode";
+      header.append(avatar, label);
       const bubble = document.createElement("div");
       bubble.className = "chat-bubble";
       bubble.textContent = text;
-      item.append(header, bubble);
+      item.append(header);
+      const fileWrap = createMessageAttachments(files);
+      if (fileWrap) item.append(fileWrap);
+      item.append(bubble);
       if (meta) {
         const footer = document.createElement("div");
         footer.className = "chat-footer";
@@ -985,11 +1206,12 @@ function getChatHtml(webview) {
       empty.hidden = true;
       document.getElementById("typing")?.remove();
       const item = document.createElement("article");
-      item.className = "chat chat-start";
+      item.className = "chat chat-assistant";
       item.dataset.role = "assistant";
+      item.dataset.attachments = "[]";
       const header = document.createElement("div");
       header.className = "chat-header";
-      header.textContent = "Jcode";
+      header.innerHTML = '<span class="avatar">J</span><span>Jcode</span>';
       const bubble = document.createElement("div");
       bubble.className = "chat-bubble";
       const footer = document.createElement("div");
@@ -997,17 +1219,17 @@ function getChatHtml(webview) {
       item.append(header, bubble, footer);
       messages.append(item);
       messages.scrollTop = messages.scrollHeight;
-      return { item, bubble, footer };
+      return { item: item, bubble: bubble, footer: footer };
     }
 
-    function finalizeLiveBubble(meta = "") {
+    function finalizeLiveBubble(meta) {
       if (!liveBubble) return;
-      liveBubble.footer.textContent = meta;
+      liveBubble.footer.textContent = meta || "";
       liveBubble = undefined;
       persist();
     }
 
-    function appendNotice(text, isError = false) {
+    function appendNotice(text, isError) {
       empty.hidden = true;
       const notice = document.createElement("div");
       notice.className = "notice" + (isError ? " error" : "");
@@ -1016,33 +1238,87 @@ function getChatHtml(webview) {
       messages.scrollTop = messages.scrollHeight;
     }
 
+    function appendCommandCard(title, rows) {
+      empty.hidden = true;
+      const card = document.createElement("section");
+      card.className = "command-card";
+      const heading = document.createElement("div");
+      heading.className = "command-title";
+      heading.textContent = title;
+      card.append(heading);
+      (rows || []).forEach(function (row) {
+        const line = document.createElement("div");
+        line.className = "command-row";
+        const key = document.createElement("code");
+        key.textContent = row[0];
+        const value = document.createElement("span");
+        value.textContent = row[1];
+        line.append(key, value);
+        card.append(line);
+      });
+      messages.append(card);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
     function setSelection(label) {
-      selection.textContent = label || "";
+      selectionLabel.textContent = label || "";
       selection.title = label || "";
-      selection.classList.toggle("visible", Boolean(label));
+      selection.classList.toggle("visible", Boolean(label) && includeSelection);
+    }
+
+    function formatBytes(size) {
+      if (!size) return "";
+      if (size < 1024) return size + " B";
+      if (size < 1024 * 1024) return Math.round(size / 1024) + " KB";
+      return (size / (1024 * 1024)).toFixed(1) + " MB";
+    }
+
+    function renderAttachments(items) {
+      attachments = items || [];
+      attachmentList.replaceChildren();
+      attachments.forEach(function (file) {
+        const chip = document.createElement("div");
+        chip.className = "attachment-chip";
+        chip.title = file.name + (file.size ? " · " + formatBytes(file.size) : "");
+        const kind = document.createElement("span");
+        kind.className = "attachment-kind";
+        kind.textContent = attachmentIcon(file.kind);
+        const name = document.createElement("span");
+        name.className = "attachment-name";
+        name.textContent = file.name;
+        const remove = document.createElement("button");
+        remove.className = "attachment-remove";
+        remove.type = "button";
+        remove.textContent = "×";
+        remove.title = "Remove attachment";
+        remove.addEventListener("click", function () { vscode.postMessage({ type: "removeAttachment", id: file.id }); });
+        chip.append(kind, name, remove);
+        attachmentList.append(chip);
+      });
+      attachmentList.classList.toggle("visible", attachments.length > 0);
     }
 
     function populateModelOptions(models) {
       modelSuggestions.replaceChildren();
-      for (const name of models) {
+      (models || []).forEach(function (name) {
         const option = document.createElement("option");
         option.value = name;
         modelSuggestions.append(option);
-      }
+      });
     }
 
     function populateEffortOptions(levels) {
       effortSelect.replaceChildren();
       const auto = document.createElement("option");
       auto.value = "";
-      auto.textContent = "Effort: auto";
+      auto.textContent = "auto";
       effortSelect.append(auto);
-      for (const level of levels) {
+      (levels || []).forEach(function (level) {
         const option = document.createElement("option");
         option.value = level;
         option.textContent = level;
         effortSelect.append(option);
-      }
+      });
     }
 
     function applyOptions(data) {
@@ -1058,10 +1334,10 @@ function getChatHtml(webview) {
       document.getElementById("new-chat").disabled = running;
       let typing = document.getElementById("typing");
       if (running && !typing) {
-        typing = document.createElement("div");
+        typing = document.createElement("article");
         typing.id = "typing";
-        typing.className = "chat chat-start";
-        typing.innerHTML = '<div class="chat-header">Jcode</div><div class="chat-bubble typing" aria-label="Jcode is responding"><i></i><i></i><i></i></div>';
+        typing.className = "chat chat-assistant";
+        typing.innerHTML = '<div class="chat-header"><span class="avatar">J</span><span>Jcode</span></div><div class="typing" aria-label="Jcode is responding"><i></i><i></i><i></i></div>';
         messages.append(typing);
         messages.scrollTop = messages.scrollHeight;
       } else if (!running) {
@@ -1070,95 +1346,149 @@ function getChatHtml(webview) {
       }
     }
 
+    function resizePrompt() {
+      prompt.style.height = "auto";
+      prompt.style.height = Math.min(prompt.scrollHeight, 200) + "px";
+    }
+
+    function commandQuery() {
+      const value = prompt.value.trimStart();
+      if (!value.startsWith("/") || value.includes("\n") || /\s/.test(value)) return undefined;
+      return value.toLowerCase();
+    }
+
+    function renderSlashMenu() {
+      const query = commandQuery();
+      slashMenu.replaceChildren();
+      if (query === undefined) {
+        slashMatches = [];
+        slashMenu.classList.remove("visible");
+        return;
+      }
+      slashMatches = slashCommands.filter(function (command) {
+        return command.name.toLowerCase().startsWith(query) || command.name.toLowerCase().includes(query.slice(1));
+      }).slice(0, 9);
+      slashIndex = Math.min(slashIndex, Math.max(0, slashMatches.length - 1));
+      slashMatches.forEach(function (command, index) {
+        const item = document.createElement("button");
+        item.className = "slash-item" + (index === slashIndex ? " selected" : "");
+        item.type = "button";
+        item.setAttribute("role", "option");
+        const name = document.createElement("code");
+        name.textContent = command.usage || command.name;
+        const description = document.createElement("span");
+        description.textContent = command.description;
+        item.append(name, description);
+        item.addEventListener("mousedown", function (event) { event.preventDefault(); acceptSlash(index); });
+        slashMenu.append(item);
+      });
+      slashMenu.classList.toggle("visible", slashMatches.length > 0);
+    }
+
+    function acceptSlash(index) {
+      const command = slashMatches[index];
+      if (!command) return false;
+      const current = prompt.value.trim();
+      if (current === command.name && !command.usage) return false;
+      prompt.value = command.name + (command.usage ? " " : "");
+      prompt.focus();
+      slashIndex = 0;
+      resizePrompt();
+      renderSlashMenu();
+      return true;
+    }
+
     function send() {
       const text = prompt.value.trim();
       if (!text || document.body.classList.contains("running")) return;
       vscode.postMessage({
         type: "send",
-        text,
-        includeSelection: includeSelection.checked,
+        text: text,
+        includeSelection: includeSelection,
         model: modelInput.value.trim(),
         effort: effortSelect.value,
+        attachmentIds: attachments.map(function (file) { return file.id; }),
       });
       prompt.value = "";
-      prompt.style.height = "auto";
+      slashMenu.classList.remove("visible");
+      resizePrompt();
     }
 
-    for (const item of saved.messages || []) {
-      appendMessage(item.role, item.text, item.meta);
-    }
+    (saved.messages || []).forEach(function (item) { appendMessage(item.role, item.text, item.meta, item.attachments); });
     empty.hidden = Boolean((saved.messages || []).length);
 
-    prompt.addEventListener("input", () => {
-      prompt.style.height = "auto";
-      prompt.style.height = Math.min(prompt.scrollHeight, 180) + "px";
+    document.querySelectorAll(".starter").forEach(function (button) {
+      button.addEventListener("click", function () { prompt.value = button.dataset.prompt || ""; resizePrompt(); prompt.focus(); });
     });
-    prompt.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && !event.shiftKey) {
-        event.preventDefault();
-        send();
+    prompt.addEventListener("input", function () { resizePrompt(); slashIndex = 0; renderSlashMenu(); });
+    prompt.addEventListener("keydown", function (event) {
+      if (slashMenu.classList.contains("visible") && slashMatches.length) {
+        if (event.key === "ArrowDown") { event.preventDefault(); slashIndex = (slashIndex + 1) % slashMatches.length; renderSlashMenu(); return; }
+        if (event.key === "ArrowUp") { event.preventDefault(); slashIndex = (slashIndex - 1 + slashMatches.length) % slashMatches.length; renderSlashMenu(); return; }
+        if (event.key === "Tab") { event.preventDefault(); acceptSlash(slashIndex); return; }
+        if (event.key === "Escape") { event.preventDefault(); slashMenu.classList.remove("visible"); return; }
+        if (event.key === "Enter" && !event.shiftKey && acceptSlash(slashIndex)) { event.preventDefault(); return; }
       }
+      if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); }
     });
+    prompt.addEventListener("paste", function (event) {
+      const files = [...(event.clipboardData?.files || [])].filter(function (file) { return file.type.startsWith("image/"); });
+      files.forEach(function (file) {
+        const reader = new FileReader();
+        reader.addEventListener("load", function () {
+          const result = String(reader.result || "");
+          vscode.postMessage({ type: "addPastedImage", name: file.name || "Pasted image", mediaType: file.type, data: result.split(",")[1] || "" });
+        });
+        reader.readAsDataURL(file);
+      });
+    });
+
     document.getElementById("send").addEventListener("click", send);
-    document.getElementById("cancel").addEventListener("click", () => vscode.postMessage({ type: "cancel" }));
-    document.getElementById("new-chat").addEventListener("click", () => vscode.postMessage({ type: "newChat" }));
-    document.getElementById("terminal").addEventListener("click", () => vscode.postMessage({ type: "openTerminal" }));
-
-    modelInput.addEventListener("change", () => {
-      vscode.postMessage({ type: "model", model: modelInput.value.trim() });
+    document.getElementById("cancel").addEventListener("click", function () { vscode.postMessage({ type: "cancel" }); });
+    document.getElementById("new-chat").addEventListener("click", function () { vscode.postMessage({ type: "newChat" }); });
+    document.getElementById("terminal").addEventListener("click", function () { vscode.postMessage({ type: "openTerminal" }); });
+    document.getElementById("attach").addEventListener("click", function () { vscode.postMessage({ type: "chooseAttachments" }); });
+    selectionToggle.addEventListener("click", function () {
+      includeSelection = !includeSelection;
+      selectionToggle.classList.toggle("active", includeSelection);
+      selection.classList.toggle("visible", includeSelection && Boolean(selectionLabel.textContent));
     });
-    effortSelect.addEventListener("change", () => {
-      vscode.postMessage({ type: "effort", effort: effortSelect.value });
-    });
+    modelInput.addEventListener("change", function () { vscode.postMessage({ type: "model", model: modelInput.value.trim() }); });
+    effortSelect.addEventListener("change", function () { vscode.postMessage({ type: "effort", effort: effortSelect.value }); });
 
-    window.addEventListener("message", ({ data }) => {
+    window.addEventListener("message", function (event) {
+      const data = event.data;
       switch (data.type) {
         case "restore":
           setSelection(data.selection);
           applyOptions(data);
+          slashCommands = data.slashCommands || [];
+          renderAttachments(data.attachments || []);
+          document.getElementById("session-status").textContent = data.error ? "Disconnected" : "Ready";
           if (data.error) appendNotice(data.error, true);
           break;
-        case "selection":
-          setSelection(data.selection);
-          if (data.focusComposer) prompt.focus();
-          break;
-        case "options":
-          if (data.model !== undefined) modelInput.value = data.model;
-          if (data.effort !== undefined) effortSelect.value = data.effort;
-          break;
-        case "user":
-          appendMessage("user", data.text, data.selection || "");
-          setSelection("");
-          break;
-        case "delta":
-          if (!liveBubble) liveBubble = createLiveBubble();
-          liveBubble.bubble.textContent += data.text;
-          messages.scrollTop = messages.scrollHeight;
-          break;
+        case "selection": setSelection(data.selection); if (data.focusComposer) prompt.focus(); break;
+        case "attachments": renderAttachments(data.attachments); break;
+        case "options": if (data.model !== undefined) modelInput.value = data.model; if (data.effort !== undefined) effortSelect.value = data.effort; break;
+        case "user": appendMessage("user", data.text, data.selection || "", data.attachments || []); setSelection(""); break;
+        case "delta": if (!liveBubble) liveBubble = createLiveBubble(); liveBubble.bubble.textContent += data.text; messages.scrollTop = messages.scrollHeight; break;
         case "assistant":
-          if (liveBubble) {
-            liveBubble.bubble.textContent = data.text;
-            liveBubble.footer.textContent = [data.provider, data.model].filter(Boolean).join(" · ");
-            liveBubble = undefined;
-            persist();
-          } else {
-            appendMessage("assistant", data.text, [data.provider, data.model].filter(Boolean).join(" · "));
-          }
+          if (liveBubble) { liveBubble.bubble.textContent = data.text; liveBubble.footer.textContent = [data.provider, data.model].filter(Boolean).join(" · "); liveBubble = undefined; persist(); }
+          else appendMessage("assistant", data.text, [data.provider, data.model].filter(Boolean).join(" · "), []);
           break;
-        case "notice":
-          appendNotice(data.text);
-          break;
-        case "error":
-          appendNotice(data.text, true);
-          break;
-        case "running":
-          setRunning(data.running);
-          break;
+        case "notice": appendNotice(data.text, false); break;
+        case "error": appendNotice(data.text, true); break;
+        case "running": setRunning(data.running); document.getElementById("session-status").textContent = data.running ? "Working…" : "Ready"; break;
+        case "commandHelp": appendCommandCard("Jcode commands", (data.commands || []).map(function (command) { return [command.usage || command.name, command.description]; })); break;
+        case "commandInfo": appendCommandCard(data.title || "Info", data.rows || []); break;
+        case "openModelPicker": modelInput.focus(); modelInput.select(); break;
+        case "openEffortPicker": effortSelect.focus(); break;
         case "cleared":
           liveBubble = undefined;
-          messages.querySelectorAll(":scope > :not(#empty)").forEach((node) => node.remove());
+          messages.querySelectorAll(":scope > :not(#empty)").forEach(function (node) { node.remove(); });
           empty.hidden = false;
           setSelection("");
+          renderAttachments([]);
           vscode.setState({ messages: [] });
           prompt.focus();
           break;
@@ -1170,7 +1500,6 @@ function getChatHtml(webview) {
 </body>
 </html>`;
 }
-
 function getNonce() {
   const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   let value = "";

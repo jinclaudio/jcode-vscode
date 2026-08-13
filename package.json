@@ -2,7 +2,7 @@
   "name": "jcode-vscode",
   "displayName": "Jcode",
   "description": "Chat with Jcode in the VS Code sidebar and send the active editor selection as context.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "jcode",
   "license": "MIT",
   "repository": {

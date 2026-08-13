@@ -11,6 +11,14 @@ and lets the user explicitly send editor selections to the agent.
   full Jcode TUI in the current workspace.
 - The Chat page supports multi-turn sessions, New Chat, cancellation, live streaming
   replies, workspace prompts, and an optional current-selection attachment.
+- The composer supports file and image attachments, removable attachment chips, and
+  direct clipboard image paste. Images use the SDK's native attachment field; other
+  files are shared as exact local paths for Jcode to read.
+- Type `/` for command autocomplete. The sidebar maps `/model`, `/models`, `/effort`,
+  `/clear`, `/compact`, `/rename`, `/info`, `/cancel`, and `/help` to SDK/session
+  operations. Prefix a prompt with `//` when it must begin with a literal `/`.
+- The Chat page uses a compact Claude Code-inspired layout with a floating composer,
+  starter prompts, attachment chips, command cards, and live connection status.
 - The Chat page has a model picker populated from Jcode's live model catalog and a
   reasoning-effort selector (`none` … `max`, subject to what the provider accepts).
   Choices persist per workspace and are applied to the chat session through the
@@ -49,8 +57,9 @@ npm run package
 - extension activation and command registration;
 - Activity Bar container and Webview view contributions;
 - chat sessions over the harness API: session creation, multi-turn reuse, New Chat,
-  streaming replies, model and reasoning-effort switching, and cancellation
-  (against a fake bridge that speaks the SDK protocol);
+  streaming replies, model and reasoning-effort switching, native slash-command
+  routing (including in-flight `/cancel` and literal slash escaping), image
+  attachments, and cancellation (against a fake bridge that speaks the SDK protocol);
 - active editor and multiple selection capture, including unsaved text;
 - exact selection ranges and temporary context-file contents;
 - Chat and terminal working directories and configured Jcode arguments;
@@ -102,5 +111,7 @@ The sidebar chats with Jcode over the stable harness API (protocol v1) through t
 official TypeScript SDK. The extension connects to the user's `jcode api-bridge`
 (autostarting it if needed), creates or resumes a per-workspace session, lists the
 real model catalog for the picker, streams `text_delta` events into the Chat page,
-and switches model and reasoning effort with `setModel` / `setReasoningEffort`.
-The terminal agent uses the public `jcode` CLI so it gets a full interactive TUI.
+sends image attachments through `run(..., { images })`, and maps supported slash
+commands to SDK methods such as `setModel`, `setReasoningEffort`, `clear`, `compact`,
+and `renameSession`. The terminal agent uses the public `jcode` CLI so it gets the
+full interactive TUI command surface.

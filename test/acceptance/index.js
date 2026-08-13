@@ -216,6 +216,7 @@ async function run() {
     "jcode.explainSelection",
     "jcode.fixSelection",
     "jcode._test.sendChat",
+    "jcode._test.addPastedImage",
     "jcode._test.newChat",
     "jcode._test.cancelChat",
     "jcode._test.setModel",
@@ -317,6 +318,56 @@ async function run() {
   assert.equal(setEffortFrame.effort, "high");
   assert.equal(setEffortFrame.session_id, "fake-session-1");
 
+  // Native slash commands are handled by the extension through the matching
+  // harness API operations, not sent to the model as ordinary prompts.
+  const sendCountBeforeSlash = frames.filter((frame) => frame.req === "send_message").length;
+  await vscode.commands.executeCommand("jcode._test.sendChat", "/model test-model-b", false);
+  await vscode.commands.executeCommand("jcode._test.sendChat", "/effort low", false);
+  await vscode.commands.executeCommand("jcode._test.sendChat", "/clear", false);
+  frames = await readBridgeFrames(bridgeLog);
+  assert.ok(frames.some((frame) => frame.req === "set_model" && frame.model === "test-model-b"));
+  assert.ok(frames.some((frame) => frame.req === "set_reasoning_effort" && frame.effort === "low"));
+  assert.ok(frames.some((frame) => frame.req === "clear" && frame.session_id === "fake-session-1"));
+  assert.equal(
+    frames.filter((frame) => frame.req === "send_message").length,
+    sendCountBeforeSlash,
+    "slash commands must not be sent as model prompts",
+  );
+
+  const imageId = await vscode.commands.executeCommand(
+    "jcode._test.addPastedImage",
+    "image/png",
+    Buffer.from("hello").toString("base64"),
+    "diagram.png",
+  );
+  assert.ok(imageId, "pasted image must be staged as an attachment");
+  const imageResult = await vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "Describe the attached image.",
+    false,
+    { attachmentIds: [imageId] },
+  );
+  assert.match(imageResult.text, /FAKE_CHAT_RESPONSE/);
+  frames = await readBridgeFrames(bridgeLog);
+  const imageSend = frames.find(
+    (frame) => frame.req === "send_message" && frame.content === "Describe the attached image.",
+  );
+  assert.deepEqual(imageSend.images, [["image/png", Buffer.from("hello").toString("base64")]]);
+
+  const literalSlashResult = await vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "//path/to/file fails; explain why.",
+    false,
+  );
+  assert.match(literalSlashResult.text, /FAKE_CHAT_RESPONSE/);
+  frames = await readBridgeFrames(bridgeLog);
+  assert.ok(
+    frames.some(
+      (frame) => frame.req === "send_message" && frame.content === "/path/to/file fails; explain why.",
+    ),
+    "a // prefix must escape a literal leading slash",
+  );
+
   // A rejected model must not break the session; the error surfaces as a notice.
   await vscode.commands.executeCommand("jcode._test.setModel", "bad-model");
   frames = await readBridgeFrames(bridgeLog);
@@ -406,7 +457,14 @@ async function run() {
     const current = await readBridgeFrames(bridgeLog);
     return current.some((frame) => frame.req === "send_message" && frame.content === "WAIT_FOR_CANCEL");
   }, "cancellable message to be sent");
-  await vscode.commands.executeCommand("jcode._test.cancelChat");
+  await vscode.commands.executeCommand("jcode._test.sendChat", "/cancel", false);
+  assert.equal(
+    (await readBridgeFrames(bridgeLog)).some(
+      (frame) => frame.req === "send_message" && frame.content === "/cancel",
+    ),
+    false,
+    "/cancel must route to the SDK cancel operation rather than the model",
+  );
   assert.equal(await cancellation, undefined);
   const afterCancellation = await vscode.commands.executeCommand(
     "jcode._test.sendChat",
