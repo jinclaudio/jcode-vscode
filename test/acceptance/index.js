@@ -318,6 +318,27 @@ async function run() {
   assert.equal(setEffortFrame.effort, "high");
   assert.equal(setEffortFrame.session_id, "fake-session-1");
 
+  const modelSetsBeforeSend = frames.filter((frame) => frame.req === "set_model").length;
+  const effortSetsBeforeSend = frames.filter((frame) => frame.req === "set_reasoning_effort").length;
+  const sameOptionsResult = await vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "Send without reapplying unchanged options.",
+    false,
+    { model: "gpt-5.5", effort: "high" },
+  );
+  assert.match(sameOptionsResult.text, /FAKE_CHAT_RESPONSE/);
+  frames = await readBridgeFrames(bridgeLog);
+  assert.equal(
+    frames.filter((frame) => frame.req === "set_model").length,
+    modelSetsBeforeSend,
+    "sending must not reapply an unchanged model",
+  );
+  assert.equal(
+    frames.filter((frame) => frame.req === "set_reasoning_effort").length,
+    effortSetsBeforeSend,
+    "sending must not reapply unchanged reasoning effort",
+  );
+
   // Native slash commands are handled by the extension through the matching
   // harness API operations, not sent to the model as ordinary prompts.
   const sendCountBeforeSlash = frames.filter((frame) => frame.req === "send_message").length;

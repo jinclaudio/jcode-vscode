@@ -31,7 +31,7 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.4.0";
+const CLIENT_NAME = "jcode-vscode/0.4.1";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -238,6 +238,7 @@ class JcodeChatViewProvider {
     this.running = false;
     this.cancelRequested = false;
     this.sessionId = undefined;
+    this.sessionInitPromise = undefined;
     this.modelWatcher = undefined;
     this.disposed = false;
     this.attachments = new Map();
@@ -252,7 +253,8 @@ class JcodeChatViewProvider {
     const messageSubscription = webviewView.webview.onDidReceiveMessage(async (message) => {
       switch (message?.type) {
         case "ready":
-          await this.restoreChat();
+          this.postBootstrap();
+          void this.restoreChat();
           break;
         case "send":
           await this.sendMessage(message.text, message.includeSelection !== false, undefined, {
@@ -322,6 +324,19 @@ class JcodeChatViewProvider {
     return vscode.workspace.getConfiguration("jcode").get("defaultEffort", "");
   }
 
+  postBootstrap() {
+    this.post({
+      type: "bootstrap",
+      selection: this.pendingSelection?.label,
+      models: this.getModelList(),
+      model: this.getSelectedModel(),
+      effortLevels: EFFORT_LEVELS,
+      effort: this.getSelectedEffort(),
+      slashCommands: SLASH_COMMANDS,
+      attachments: [...this.attachments.values()].map(publicAttachment),
+    });
+  }
+
   async setSelectedModel(model) {
     const value = typeof model === "string" ? model.trim() : "";
     await this.context.workspaceState.update(CHAT_MODEL_KEY, value || undefined);
@@ -365,6 +380,19 @@ class JcodeChatViewProvider {
    */
   async ensureSession() {
     const client = await getJcodeClient();
+    if (this.sessionId) {
+      return client;
+    }
+    if (!this.sessionInitPromise) {
+      this.sessionInitPromise = this.initializeSession(client).finally(() => {
+        this.sessionInitPromise = undefined;
+      });
+    }
+    await this.sessionInitPromise;
+    return client;
+  }
+
+  async initializeSession(client) {
     if (!this.sessionId) {
       const savedId = this.context.workspaceState.get(CHAT_SESSION_KEY);
       if (savedId) {
@@ -383,7 +411,6 @@ class JcodeChatViewProvider {
       await this.context.workspaceState.update(CHAT_SESSION_KEY, session.session_id);
       await this.applySessionDefaults(client);
     }
-    return client;
   }
 
   async applySessionDefaults(client) {
@@ -565,10 +592,16 @@ class JcodeChatViewProvider {
     }
 
     if (options.model !== undefined) {
-      await this.setSelectedModel(options.model);
+      const model = typeof options.model === "string" ? options.model.trim() : "";
+      if (model !== this.getSelectedModel()) {
+        await this.setSelectedModel(model);
+      }
     }
     if (options.effort !== undefined) {
-      await this.setSelectedEffort(options.effort);
+      const effort = typeof options.effort === "string" ? options.effort.trim() : "";
+      if (effort !== this.getSelectedEffort()) {
+        await this.setSelectedEffort(effort);
+      }
     }
 
     let selection = explicitSelection;
@@ -769,6 +802,13 @@ class JcodeChatViewProvider {
 
   async newChat() {
     this.cancelRequested = true;
+    if (this.sessionInitPromise) {
+      try {
+        await this.sessionInitPromise;
+      } catch {
+        // A failed initialization should not prevent creating a fresh session.
+      }
+    }
     if (clientPromise) {
       try {
         const client = await clientPromise;
@@ -1466,6 +1506,13 @@ function getChatHtml(webview) {
           renderAttachments(data.attachments || []);
           document.getElementById("session-status").textContent = data.error ? "Disconnected" : "Ready";
           if (data.error) appendNotice(data.error, true);
+          break;
+        case "bootstrap":
+          setSelection(data.selection);
+          applyOptions(data);
+          slashCommands = data.slashCommands || [];
+          renderAttachments(data.attachments || []);
+          document.getElementById("session-status").textContent = "Connecting…";
           break;
         case "selection": setSelection(data.selection); if (data.focusComposer) prompt.focus(); break;
         case "attachments": renderAttachments(data.attachments); break;
