@@ -1,0 +1,115 @@
+{
+  "name": "jcode-vscode",
+  "displayName": "Jcode",
+  "description": "Run Jcode inside VS Code and send the active editor selection as context.",
+  "version": "0.1.0",
+  "publisher": "jcode",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "jcode",
+    "ai",
+    "agent",
+    "coding"
+  ],
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "jcode.open",
+        "title": "Jcode: Open Agent"
+      },
+      {
+        "command": "jcode.askSelection",
+        "title": "Jcode: Ask About Selection"
+      },
+      {
+        "command": "jcode.explainSelection",
+        "title": "Jcode: Explain Selection"
+      },
+      {
+        "command": "jcode.fixSelection",
+        "title": "Jcode: Fix Selection"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "jcode.askSelection",
+          "group": "jcode@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "jcode.explainSelection",
+          "group": "jcode@2",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "jcode.fixSelection",
+          "group": "jcode@3",
+          "when": "editorHasSelection"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "jcode.open"
+        },
+        {
+          "command": "jcode.askSelection"
+        },
+        {
+          "command": "jcode.explainSelection"
+        },
+        {
+          "command": "jcode.fixSelection"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "jcode.askSelection",
+        "key": "ctrl+shift+j",
+        "mac": "cmd+shift+j",
+        "when": "editorTextFocus && editorHasSelection"
+      }
+    ],
+    "configuration": {
+      "title": "Jcode",
+      "properties": {
+        "jcode.executablePath": {
+          "type": "string",
+          "default": "jcode",
+          "description": "Path to the Jcode executable."
+        },
+        "jcode.launchArguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra arguments passed when starting the interactive Jcode terminal."
+        },
+        "jcode.maxSelectionCharacters": {
+          "type": "number",
+          "default": 200000,
+          "minimum": 1000,
+          "description": "Maximum number of selected characters that may be sent to Jcode."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "node --check extension.js",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.6.0"
+  }
+}
