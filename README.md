@@ -29,6 +29,27 @@ npm install
 npm run package
 ```
 
+## Acceptance test
+
+`test/acceptance/index.js` runs inside a real VS Code Extension Host. It verifies:
+
+- extension activation and command registration;
+- active editor and multiple selection capture, including unsaved text;
+- exact selection ranges and temporary context-file contents;
+- terminal working directory and configured Jcode arguments;
+- no-selection and oversized-selection safety paths;
+- terminal disposal and restart;
+- startup of the real `jcode` executable in a VS Code integrated terminal.
+
+Run it from a graphical desktop with:
+
+```bash
+npm run test:acceptance
+```
+
+On Linux CI, the same test can run under Xvfb by invoking VS Code with
+`--extensionDevelopmentPath` and `--extensionTestsPath`.
+
 ## Configuration
 
 - `jcode.executablePath`: absolute path or command name for Jcode.
