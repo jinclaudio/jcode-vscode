@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
+const fsSync = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const vscode = require("vscode");
@@ -224,6 +225,8 @@ async function run() {
     "jcode._test.captureSelection",
     "jcode._test.getChatState",
     "jcode._test.closeClient",
+    "jcode._test.useMockView",
+    "jcode._test.getPostedMessages",
   ]) {
     assert.ok(commands.includes(command), `${command} must be registered`);
   }
@@ -237,6 +240,24 @@ async function run() {
   await updateSetting("launchArguments", ["--provider", "test-provider"]);
   await updateSetting("maxSelectionCharacters", 200000);
   await vscode.commands.executeCommand("jcode._test.newChat");
+
+  await vscode.commands.executeCommand("jcode._test.useMockView");
+  const initialUiResult = await vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "First sidebar message.",
+    false,
+  );
+  assert.match(initialUiResult.text, /FAKE_CHAT_RESPONSE/);
+  const initialUiMessages = await vscode.commands.executeCommand("jcode._test.getPostedMessages");
+  const initialUser = initialUiMessages.find((message) => message.type === "user" && message.text === "First sidebar message.");
+  assert.ok(initialUser?.turnId, "the first sidebar turn must receive a turn id");
+  assert.deepEqual(
+    initialUiMessages
+      .filter((message) => message.turnId === initialUser.turnId)
+      .map((message) => message.type + (message.type === "running" ? `:${message.running}` : "")),
+    ["running:true", "user", "sendAccepted", "delta", "assistant", "running:false"],
+    "the first sidebar message must reach the webview in usable order",
+  );
 
   const document = await vscode.workspace.openTextDocument(sourceFile);
   const editor = await vscode.window.showTextDocument(document);
@@ -254,6 +275,9 @@ async function run() {
   );
   assert.match(firstResult.text, /FAKE_CHAT_RESPONSE/);
   assert.equal(firstResult.session_id, "fake-session-1");
+
+  const webviewSource = fsSync.readFileSync(path.join(__dirname, "../../extension.js"), "utf8");
+  assert.match(webviewSource, /<select id="model"/, "the model catalog must use a visible select control");
 
   let frames = await readBridgeFrames(bridgeLog);
   const createFrame = frames.find((frame) => frame.req === "create_session");

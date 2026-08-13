@@ -1,5 +1,7 @@
 const path = require("node:path");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
 const { spawn } = require("node:child_process");
 const vscode = require("vscode");
 
@@ -32,7 +34,7 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.5.0";
+const CLIENT_NAME = "jcode-vscode/0.5.1";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -68,6 +70,7 @@ let sdkPromise;
 let clientPromise;
 let currentClient;
 let bridgeProcess;
+let extensionApiSocket;
 
 function getSdk() {
   if (!sdkPromise) {
@@ -98,6 +101,10 @@ function cancelledError() {
 
 /** Connect to the harness API, starting `jcode api-bridge` when needed. */
 async function getJcodeClient() {
+  if (currentClient?.closed) {
+    currentClient = undefined;
+    clientPromise = undefined;
+  }
   if (!clientPromise) {
     clientPromise = connectWithBridge();
   }
@@ -113,7 +120,7 @@ async function getJcodeClient() {
 
 async function connectWithBridge() {
   const { JcodeClient } = await getSdk();
-  const apiSocket = process.env.JCODE_API_SOCKET;
+  const apiSocket = process.env.JCODE_API_SOCKET || extensionApiSocket;
   try {
     const client = await JcodeClient.connect({ clientName: CLIENT_NAME, socketPath: apiSocket });
     watchClientLiveness(client);
@@ -122,6 +129,7 @@ async function connectWithBridge() {
     if (firstError?.code !== "connect_failed") {
       throw firstError;
     }
+    removeOwnedStaleSocket(apiSocket);
     spawnBridge(apiSocket);
     const deadline = Date.now() + BRIDGE_CONNECT_TIMEOUT_MS;
     let lastError = firstError;
@@ -145,6 +153,15 @@ async function connectWithBridge() {
   }
 }
 
+function removeOwnedStaleSocket(apiSocket) {
+  if (process.platform === "win32" || !apiSocket || apiSocket !== extensionApiSocket) return;
+  try {
+    fs.unlinkSync(apiSocket);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
 function watchClientLiveness(client) {
   currentClient = client;
   client.on("close", () => {
@@ -160,7 +177,7 @@ function spawnBridge(apiSocket) {
     return;
   }
   const config = vscode.workspace.getConfiguration("jcode");
-  const executable = config.get("executablePath", "jcode");
+  const executable = resolveJcodeExecutable(config.get("executablePath", "jcode"));
   const configuredArguments = config.get("launchArguments", []);
   const args = [...configuredArguments, "--no-update", "api-bridge"];
   if (apiSocket) {
@@ -186,10 +203,20 @@ function spawnBridge(apiSocket) {
   }
 }
 
+function resolveJcodeExecutable(configured) {
+  if (configured !== "jcode") return configured;
+  const local = path.join(os.homedir(), ".local", "bin", "jcode");
+  return fs.existsSync(local) ? local : configured;
+}
+
 /**
  * @param {vscode.ExtensionContext} context
  */
 function activate(context) {
+  if (context.globalStorageUri.scheme === "file") {
+    fs.mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
+    extensionApiSocket = path.join(context.globalStorageUri.fsPath, "api.sock");
+  }
   lastTextEditor = vscode.window.activeTextEditor;
   const chatProvider = new JcodeChatViewProvider(context);
 
@@ -255,7 +282,27 @@ function activate(context) {
         attachmentCount: chatProvider.attachments.size,
       })),
       vscode.commands.registerCommand("jcode._test.closeClient", async () => {
-        if (currentClient) await currentClient.close();
+        const client = currentClient;
+        currentClient = undefined;
+        clientPromise = undefined;
+        if (client) await client.close();
+      }),
+      vscode.commands.registerCommand("jcode._test.useMockView", () => {
+        const posted = [];
+        chatProvider.view = {
+          webview: {
+            postMessage: async (message) => {
+              if (message.type === "running" && message.running) await sleep(20);
+              posted.push(message);
+              return true;
+            },
+          },
+        };
+        chatProvider.testPostedMessages = posted;
+      }),
+      vscode.commands.registerCommand("jcode._test.getPostedMessages", async () => {
+        await chatProvider.postChain;
+        return chatProvider.testPostedMessages || [];
       }),
     );
   }
@@ -277,6 +324,7 @@ class JcodeChatViewProvider {
     this.disposed = false;
     this.nextTurnId = 1;
     this.activeTurnId = undefined;
+    this.postChain = Promise.resolve();
     this.attachments = new Map();
     this.nextAttachmentId = 1;
   }
@@ -703,7 +751,6 @@ class JcodeChatViewProvider {
       attachments = await this.consumeAttachments(options.attachmentIds);
       if (!this.isTurnActive(turnId)) throw cancelledError();
 
-      await this.focus();
       if (!this.isTurnActive(turnId)) throw cancelledError();
       this.post({ type: "user", text: instruction, selection: selection?.label, attachments: attachments.public, turnId });
       this.post({ type: "sendAccepted", turnId });
@@ -931,7 +978,11 @@ class JcodeChatViewProvider {
   }
 
   post(message) {
-    void this.view?.webview.postMessage(message);
+    const view = this.view;
+    if (!view || this.disposed) return;
+    this.postChain = this.postChain
+      .then(() => this.view === view ? view.webview.postMessage(message) : false)
+      .catch(() => false);
   }
 
   dispose() {
@@ -1251,8 +1302,7 @@ function getChatHtml(webview) {
             <button id="selection-toggle" class="small-btn active" type="button" title="Include current editor selection"><svg viewBox="0 0 24 24"><path d="M8 5H5v3M16 5h3v3M8 19H5v-3M16 19h3v-3M9 9h6v6H9z"/></svg><span>Selection</span></button>
           </div>
           <div class="tool-right">
-            <input id="model" class="model-input" list="model-suggestions" autocomplete="off" spellcheck="false" placeholder="Model: auto" aria-label="Model">
-            <datalist id="model-suggestions"></datalist>
+            <select id="model" class="model-input" aria-label="Model"></select>
             <select id="effort" class="effort-select" aria-label="Reasoning effort"></select>
             <button id="cancel" class="send-btn" type="button" title="Cancel response" aria-label="Cancel response"><svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1"/></svg></button>
             <button id="send" class="send-btn" type="button" title="Send message" aria-label="Send message"><svg viewBox="0 0 24 24"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5"/></svg></button>
@@ -1273,7 +1323,6 @@ function getChatHtml(webview) {
     const attachmentList = document.getElementById("attachments");
     const slashMenu = document.getElementById("slash-menu");
     const modelInput = document.getElementById("model");
-    const modelSuggestions = document.getElementById("model-suggestions");
     const effortSelect = document.getElementById("effort");
     const saved = vscode.getState() || { messages: [] };
     let liveBubble;
@@ -1285,6 +1334,7 @@ function getChatHtml(webview) {
     let submitting = false;
     let pendingDraft = "";
     let activeTurnId;
+    const closedTurnIds = new Set();
     let pendingPastes = 0;
 
     function persist() {
@@ -1447,13 +1497,21 @@ function getChatHtml(webview) {
       attachmentList.classList.toggle("visible", attachments.length > 0);
     }
 
-    function populateModelOptions(models) {
-      modelSuggestions.replaceChildren();
-      (models || []).forEach(function (name) {
+    function populateModelOptions(models, selected) {
+      const names = [...new Set((models || []).filter(Boolean))];
+      modelInput.replaceChildren();
+      const auto = document.createElement("option");
+      auto.value = "";
+      auto.textContent = "Model: auto";
+      modelInput.append(auto);
+      if (selected && !names.includes(selected)) names.unshift(selected);
+      names.forEach(function (name) {
         const option = document.createElement("option");
         option.value = name;
-        modelSuggestions.append(option);
+        option.textContent = name;
+        modelInput.append(option);
       });
+      modelInput.value = selected || "";
     }
 
     function populateEffortOptions(levels) {
@@ -1471,9 +1529,8 @@ function getChatHtml(webview) {
     }
 
     function applyOptions(data) {
-      populateModelOptions(data.models || []);
+      populateModelOptions(data.models || [], data.model !== undefined ? data.model : modelInput.value);
       populateEffortOptions(data.effortLevels || []);
-      if (data.model !== undefined) modelInput.value = data.model;
       if (data.effort !== undefined) effortSelect.value = data.effort;
     }
 
@@ -1648,8 +1705,12 @@ function getChatHtml(webview) {
           break;
         case "selection": setSelection(data.selection); if (data.focusComposer) prompt.focus(); break;
         case "attachments": renderAttachments(data.attachments); break;
-        case "options": if (data.model !== undefined) modelInput.value = data.model; if (data.effort !== undefined) effortSelect.value = data.effort; break;
-        case "user": appendMessage("user", data.text, data.selection || "", data.attachments || []); setSelection(""); break;
+        case "options": if (data.model !== undefined) populateModelOptions([...modelInput.options].map(function (option) { return option.value; }), data.model); if (data.effort !== undefined) effortSelect.value = data.effort; break;
+        case "user":
+          if (data.turnId !== undefined) activeTurnId = data.turnId;
+          appendMessage("user", data.text, data.selection || "", data.attachments || []);
+          setSelection("");
+          break;
         case "sendAccepted":
         case "sendHandled":
           submitting = false;
@@ -1663,9 +1724,9 @@ function getChatHtml(webview) {
           document.getElementById("send").disabled = false;
           resizePrompt();
           break;
-        case "delta": if (data.turnId !== undefined && data.turnId !== activeTurnId) break; if (!liveBubble) liveBubble = createLiveBubble(); liveBubble.bubble.textContent += data.text; messages.scrollTop = messages.scrollHeight; break;
+        case "delta": if (data.turnId !== undefined && (closedTurnIds.has(data.turnId) || (activeTurnId !== undefined && data.turnId !== activeTurnId))) break; if (!liveBubble) liveBubble = createLiveBubble(); liveBubble.bubble.textContent += data.text; messages.scrollTop = messages.scrollHeight; break;
         case "assistant":
-          if (data.turnId !== undefined && data.turnId !== activeTurnId) break;
+          if (data.turnId !== undefined && (closedTurnIds.has(data.turnId) || (activeTurnId !== undefined && data.turnId !== activeTurnId))) break;
           if (liveBubble) { liveBubble.bubble.textContent = data.text; liveBubble.footer.textContent = [data.provider, data.model].filter(Boolean).join(" · "); liveBubble = undefined; persist(); }
           else appendMessage("assistant", data.text, [data.provider, data.model].filter(Boolean).join(" · "), []);
           break;
@@ -1674,16 +1735,20 @@ function getChatHtml(webview) {
         case "running":
           if (data.running) activeTurnId = data.turnId;
           else if (data.turnId !== undefined && data.turnId !== activeTurnId) break;
-          if (!data.running) activeTurnId = undefined;
+          if (!data.running) {
+            if (data.turnId !== undefined) closedTurnIds.add(data.turnId);
+            activeTurnId = undefined;
+          }
           setRunning(data.running);
           document.getElementById("session-status").textContent = data.running ? "Working…" : "Ready";
           break;
         case "commandHelp": appendCommandCard("Jcode commands", (data.commands || []).map(function (command) { return [command.usage || command.name, command.description]; })); break;
         case "commandInfo": appendCommandCard(data.title || "Info", data.rows || []); break;
-        case "openModelPicker": modelInput.focus(); modelInput.select(); break;
+        case "openModelPicker": modelInput.focus(); break;
         case "openEffortPicker": effortSelect.focus(); break;
         case "cleared":
           activeTurnId = undefined;
+          closedTurnIds.clear();
           submitting = false;
           pendingDraft = "";
           document.getElementById("send").disabled = false;
