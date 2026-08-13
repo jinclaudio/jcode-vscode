@@ -9,12 +9,6 @@
     "type": "git",
     "url": "https://github.com/jinclaudio/jcode-vscode.git"
   },
-  "files": [
-    "extension.js",
-    "media/",
-    "README.md",
-    "LICENSE"
-  ],
   "engines": {
     "vscode": "^1.95.0"
   },

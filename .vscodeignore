@@ -8,8 +8,13 @@ node_modules/@1jehuang/jcode-linux-x64/**
 node_modules/@1jehuang/jcode-win32-arm64/**
 node_modules/@1jehuang/jcode-win32-x64/**
 
-# Local artifacts
+# Local artifacts and repository noise
 **/*.vsix
 server.log
 bun.lock
 **/*.map
+test/**
+.git/**
+package-lock.json
+.gitignore
+
