@@ -182,7 +182,7 @@ async function readBridgeFrames(bridgeLog) {
 
 async function run() {
   const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "jcode-vscode-test-"));
-  const resultMarker = path.join(os.tmpdir(), "jcode-vscode-acceptance-result.txt");
+  const resultMarker = process.env.JCODE_VSCODE_ACCEPTANCE_MARKER || path.join(os.tmpdir(), "jcode-vscode-acceptance-result.txt");
   try {
     await fs.unlink(resultMarker);
   } catch {
@@ -222,6 +222,8 @@ async function run() {
     "jcode._test.setModel",
     "jcode._test.setEffort",
     "jcode._test.captureSelection",
+    "jcode._test.getChatState",
+    "jcode._test.closeClient",
   ]) {
     assert.ok(commands.includes(command), `${command} must be registered`);
   }
@@ -393,6 +395,25 @@ async function run() {
   await vscode.commands.executeCommand("jcode._test.setModel", "bad-model");
   frames = await readBridgeFrames(bridgeLog);
   assert.ok(frames.some((frame) => frame.req === "set_model" && frame.model === "bad-model"));
+  assert.equal(
+    (await vscode.commands.executeCommand("jcode._test.getChatState")).model,
+    "test-model-b",
+    "a rejected model must not replace the last successfully applied model",
+  );
+
+  const attachCountBeforeReconnect = frames.filter((frame) => frame.req === "attach_session").length;
+  await vscode.commands.executeCommand("jcode._test.closeClient");
+  const reconnectResult = await vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "Reconnect and continue the same session.",
+    false,
+  );
+  assert.match(reconnectResult.text, /FAKE_CHAT_RESPONSE/);
+  frames = await readBridgeFrames(bridgeLog);
+  assert.ok(
+    frames.filter((frame) => frame.req === "attach_session").length > attachCountBeforeReconnect,
+    "a replacement SDK connection must reattach the existing session before sending",
+  );
 
   const framesBeforeNoop = (await readBridgeFrames(bridgeLog)).length;
   await vscode.commands.executeCommand("jcode.explainSelection");
@@ -478,6 +499,18 @@ async function run() {
     const current = await readBridgeFrames(bridgeLog);
     return current.some((frame) => frame.req === "send_message" && frame.content === "WAIT_FOR_CANCEL");
   }, "cancellable message to be sent");
+  const sendCountDuringTurn = (await readBridgeFrames(bridgeLog)).filter((frame) => frame.req === "send_message").length;
+  const rejectedConcurrent = await vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "This concurrent send must be rejected.",
+    false,
+  );
+  assert.equal(rejectedConcurrent, undefined);
+  assert.equal(
+    (await readBridgeFrames(bridgeLog)).filter((frame) => frame.req === "send_message").length,
+    sendCountDuringTurn,
+    "a second send must not reach the daemon while a turn is active",
+  );
   await vscode.commands.executeCommand("jcode._test.sendChat", "/cancel", false);
   assert.equal(
     (await readBridgeFrames(bridgeLog)).some(
@@ -508,4 +541,14 @@ async function run() {
   console.log("JCODE_VSCODE_ACCEPTANCE: PASS");
 }
 
-module.exports = { run };
+module.exports = {
+  run: async () => {
+    try {
+      return await run();
+    } catch (error) {
+      const marker = process.env.JCODE_VSCODE_ACCEPTANCE_MARKER || path.join(os.tmpdir(), "jcode-vscode-acceptance-result.txt");
+      await fs.writeFile(marker, `FAIL\n${error?.stack || error}\n`);
+      throw error;
+    }
+  },
+};

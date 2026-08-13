@@ -1,4 +1,5 @@
 const path = require("node:path");
+const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const vscode = require("vscode");
 
@@ -31,7 +32,7 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.4.1";
+const CLIENT_NAME = "jcode-vscode/0.5.0";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -65,6 +66,7 @@ let lastTextEditor;
 // drive setModel / setReasoningEffort on the session.
 let sdkPromise;
 let clientPromise;
+let currentClient;
 let bridgeProcess;
 
 function getSdk() {
@@ -88,6 +90,12 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function cancelledError() {
+  const error = new Error("Response cancelled.");
+  error.cancelled = true;
+  return error;
+}
+
 /** Connect to the harness API, starting `jcode api-bridge` when needed. */
 async function getJcodeClient() {
   if (!clientPromise) {
@@ -95,6 +103,7 @@ async function getJcodeClient() {
   }
   try {
     const client = await clientPromise;
+    currentClient = client;
     return client;
   } catch (error) {
     clientPromise = undefined;
@@ -118,6 +127,9 @@ async function connectWithBridge() {
     let lastError = firstError;
     while (Date.now() < deadline) {
       await sleep(300);
+      if (!bridgeProcess || bridgeProcess.exitCode !== null || bridgeProcess.signalCode !== null) {
+        spawnBridge(apiSocket);
+      }
       try {
         const client = await JcodeClient.connect({ clientName: CLIENT_NAME, socketPath: apiSocket });
         watchClientLiveness(client);
@@ -134,8 +146,12 @@ async function connectWithBridge() {
 }
 
 function watchClientLiveness(client) {
+  currentClient = client;
   client.on("close", () => {
-    clientPromise = undefined;
+    if (currentClient === client) {
+      currentClient = undefined;
+      clientPromise = undefined;
+    }
   });
 }
 
@@ -155,6 +171,12 @@ function spawnBridge(apiSocket) {
       detached: true,
       stdio: "ignore",
       env: { ...process.env },
+    });
+    child.on("error", () => {
+      if (bridgeProcess === child) bridgeProcess = undefined;
+    });
+    child.on("exit", () => {
+      if (bridgeProcess === child) bridgeProcess = undefined;
     });
     child.unref();
     bridgeProcess = child;
@@ -225,6 +247,16 @@ function activate(context) {
       vscode.commands.registerCommand("jcode._test.captureSelection", () =>
         captureSelectionContext(context, false),
       ),
+      vscode.commands.registerCommand("jcode._test.getChatState", () => ({
+        running: chatProvider.running,
+        sessionId: chatProvider.sessionId,
+        model: chatProvider.getSelectedModel(),
+        effort: chatProvider.getSelectedEffort(),
+        attachmentCount: chatProvider.attachments.size,
+      })),
+      vscode.commands.registerCommand("jcode._test.closeClient", async () => {
+        if (currentClient) await currentClient.close();
+      }),
     );
   }
 }
@@ -238,9 +270,13 @@ class JcodeChatViewProvider {
     this.running = false;
     this.cancelRequested = false;
     this.sessionId = undefined;
+    this.sessionClient = undefined;
     this.sessionInitPromise = undefined;
     this.modelWatcher = undefined;
+    this.modelWatcherClient = undefined;
     this.disposed = false;
+    this.nextTurnId = 1;
+    this.activeTurnId = undefined;
     this.attachments = new Map();
     this.nextAttachmentId = 1;
   }
@@ -253,6 +289,9 @@ class JcodeChatViewProvider {
     const messageSubscription = webviewView.webview.onDidReceiveMessage(async (message) => {
       switch (message?.type) {
         case "ready":
+          if (!message.hasHistory && !this.sessionId) {
+            await this.context.workspaceState.update(CHAT_SESSION_KEY, undefined);
+          }
           this.postBootstrap();
           void this.restoreChat();
           break;
@@ -337,39 +376,57 @@ class JcodeChatViewProvider {
     });
   }
 
-  async setSelectedModel(model) {
+  async setSelectedModel(model, allowWhileRunning = false) {
     const value = typeof model === "string" ? model.trim() : "";
-    await this.context.workspaceState.update(CHAT_MODEL_KEY, value || undefined);
+    const previous = this.getSelectedModel();
+    if (this.running && !allowWhileRunning) {
+      this.post({ type: "notice", text: "Cancel the active response before changing models." });
+      this.post({ type: "options", model: previous });
+      return false;
+    }
     if (!value) {
-      return;
+      await this.context.workspaceState.update(CHAT_MODEL_KEY, undefined);
+      this.post({ type: "options", model: previous });
+      this.post({ type: "notice", text: "Automatic model selection applies to the next new chat." });
+      return true;
     }
     try {
-      const client = await getJcodeClient();
-      if (!this.sessionId) {
-        await this.ensureSession();
-      }
+      const client = await this.ensureSession();
       await client.setModel(this.sessionId, value);
+      await this.context.workspaceState.update(CHAT_MODEL_KEY, value);
       this.post({ type: "options", model: value });
+      return true;
     } catch (error) {
-      this.post({ type: "notice", text: `Could not switch model: ${errorMessage(error)}` });
+      this.post({ type: "options", model: previous });
+      this.post({ type: "error", text: `Could not switch model: ${errorMessage(error)}` });
+      return false;
     }
   }
 
-  async setSelectedEffort(effort) {
+  async setSelectedEffort(effort, allowWhileRunning = false) {
     const value = typeof effort === "string" ? effort.trim() : "";
-    await this.context.workspaceState.update(CHAT_EFFORT_KEY, value || undefined);
+    const previous = this.getSelectedEffort();
+    if (this.running && !allowWhileRunning) {
+      this.post({ type: "notice", text: "Cancel the active response before changing reasoning effort." });
+      this.post({ type: "options", effort: previous });
+      return false;
+    }
     if (!value) {
-      return;
+      await this.context.workspaceState.update(CHAT_EFFORT_KEY, undefined);
+      this.post({ type: "options", effort: "" });
+      this.post({ type: "notice", text: "Automatic reasoning effort applies to the next new chat." });
+      return true;
     }
     try {
-      const client = await getJcodeClient();
-      if (!this.sessionId) {
-        await this.ensureSession();
-      }
+      const client = await this.ensureSession();
       await client.setReasoningEffort(this.sessionId, value);
+      await this.context.workspaceState.update(CHAT_EFFORT_KEY, value);
       this.post({ type: "options", effort: value });
+      return true;
     } catch (error) {
-      this.post({ type: "notice", text: `Could not set reasoning effort: ${errorMessage(error)}` });
+      this.post({ type: "options", effort: previous });
+      this.post({ type: "error", text: `Could not set reasoning effort: ${errorMessage(error)}` });
+      return false;
     }
   }
 
@@ -380,7 +437,7 @@ class JcodeChatViewProvider {
    */
   async ensureSession() {
     const client = await getJcodeClient();
-    if (this.sessionId) {
+    if (this.sessionId && this.sessionClient === client) {
       return client;
     }
     if (!this.sessionInitPromise) {
@@ -389,16 +446,31 @@ class JcodeChatViewProvider {
       });
     }
     await this.sessionInitPromise;
+    if (this.sessionClient !== client) {
+      return this.ensureSession();
+    }
     return client;
   }
 
   async initializeSession(client) {
+    const candidateId = this.sessionId || this.context.workspaceState.get(CHAT_SESSION_KEY);
+    if (candidateId && this.sessionClient !== client) {
+      try {
+        await client.attachSession(candidateId);
+        this.sessionId = candidateId;
+        this.sessionClient = client;
+      } catch {
+        if (this.sessionId === candidateId) this.sessionId = undefined;
+        await this.context.workspaceState.update(CHAT_SESSION_KEY, undefined);
+      }
+    }
     if (!this.sessionId) {
       const savedId = this.context.workspaceState.get(CHAT_SESSION_KEY);
-      if (savedId) {
+      if (savedId && savedId !== candidateId) {
         try {
           await client.attachSession(savedId);
           this.sessionId = savedId;
+          this.sessionClient = client;
         } catch {
           // The session is gone or belongs to another instance; create fresh.
         }
@@ -408,6 +480,7 @@ class JcodeChatViewProvider {
       const workingDir = getWorkingDirectory(getCurrentTextEditor());
       const session = await client.createSession(workingDir);
       this.sessionId = session.session_id;
+      this.sessionClient = client;
       await this.context.workspaceState.update(CHAT_SESSION_KEY, session.session_id);
       await this.applySessionDefaults(client);
     }
@@ -457,7 +530,7 @@ class JcodeChatViewProvider {
       sessionId,
       selection,
       models: models.length > 0 ? models : this.getModelList(),
-      model: this.getSelectedModel() || current || "",
+      model: current || this.getSelectedModel() || "",
       effortLevels: EFFORT_LEVELS,
       effort: this.getSelectedEffort(),
       slashCommands: SLASH_COMMANDS,
@@ -530,15 +603,17 @@ class JcodeChatViewProvider {
   }
 
   watchModel(client) {
-    if (this.modelWatcher) {
-      client.off("model_info", this.modelWatcher);
+    if (this.modelWatcher && this.modelWatcherClient) {
+      this.modelWatcherClient.off("model_info", this.modelWatcher);
     }
     this.modelWatcher = (event) => {
       if (event.session_id === this.sessionId && event.model) {
+        void this.context.workspaceState.update(CHAT_MODEL_KEY, event.model);
         this.post({ type: "options", model: event.model });
       }
     };
     client.on("model_info", this.modelWatcher);
+    this.modelWatcherClient = client;
   }
 
   async stageCurrentSelection() {
@@ -566,6 +641,7 @@ class JcodeChatViewProvider {
   async sendMessage(text, includeSelection = true, explicitSelection, options = {}) {
     let instruction = typeof text === "string" ? text.trim() : "";
     if (!instruction) {
+      this.post({ type: "sendRejected", text: typeof text === "string" ? text : "" });
       return undefined;
     }
 
@@ -576,95 +652,113 @@ class JcodeChatViewProvider {
       const commandName = instruction.split(/\s+/, 1)[0];
       if (this.running && commandName !== "/cancel") {
         void vscode.window.showInformationMessage("Jcode is already responding. Use /cancel before another command.");
+        this.post({ type: "sendRejected", text: instruction });
         return undefined;
       }
-      if (await this.executeSlashCommand(instruction)) return undefined;
+      if (await this.executeSlashCommand(instruction)) {
+        this.post({ type: "sendHandled" });
+        return undefined;
+      }
       this.post({
         type: "error",
         text: `The command ${JSON.stringify(commandName)} is not available in the sidebar yet. Prefix the message with // to send a literal leading slash, or open the terminal agent for the full Jcode command surface.`,
       });
+      this.post({ type: "sendRejected", text: instruction });
       return undefined;
     }
 
     if (this.running) {
       void vscode.window.showInformationMessage("Jcode is already responding. Cancel it before sending another message.");
+      this.post({ type: "sendRejected", text: instruction });
       return undefined;
     }
 
-    if (options.model !== undefined) {
-      const model = typeof options.model === "string" ? options.model.trim() : "";
-      if (model !== this.getSelectedModel()) {
-        await this.setSelectedModel(model);
-      }
-    }
-    if (options.effort !== undefined) {
-      const effort = typeof options.effort === "string" ? options.effort.trim() : "";
-      if (effort !== this.getSelectedEffort()) {
-        await this.setSelectedEffort(effort);
-      }
-    }
-
-    let selection = explicitSelection;
-    if (includeSelection && !selection) {
-      selection = this.pendingSelection || await captureSelectionContext(this.context, false);
-    }
-    this.pendingSelection = undefined;
-
-    let attachments;
-    try {
-      attachments = await this.consumeAttachments(options.attachmentIds);
-    } catch (error) {
-      this.post({ type: "error", text: `Could not read an attachment: ${errorMessage(error)}` });
-      return undefined;
-    }
-
-    await this.focus();
-    this.post({ type: "user", text: instruction, selection: selection?.label, attachments: attachments.public });
-    this.post({ type: "running", running: true });
+    const turnId = this.nextTurnId++;
+    this.activeTurnId = turnId;
     this.running = true;
     this.cancelRequested = false;
+    this.post({ type: "running", running: true, turnId });
+    let attachments;
+    let submitted = false;
+    try {
+      if (options.model !== undefined) {
+        const model = typeof options.model === "string" ? options.model.trim() : "";
+        if (model && model !== this.getSelectedModel() && !(await this.setSelectedModel(model, true))) {
+          throw new Error("The selected model could not be applied.");
+        }
+      }
+      if (options.effort !== undefined) {
+        const effort = typeof options.effort === "string" ? options.effort.trim() : "";
+        if (effort && effort !== this.getSelectedEffort() && !(await this.setSelectedEffort(effort, true))) {
+          throw new Error("The selected reasoning effort could not be applied.");
+        }
+      }
+      if (!this.isTurnActive(turnId)) throw cancelledError();
 
-    const contextParts = [instruction];
-    if (selection) {
-      contextParts.push(
+      let selection = explicitSelection;
+      if (includeSelection && !selection) {
+        selection = this.pendingSelection || await captureSelectionContext(this.context, false);
+      }
+      this.pendingSelection = undefined;
+      attachments = await this.consumeAttachments(options.attachmentIds);
+      if (!this.isTurnActive(turnId)) throw cancelledError();
+
+      await this.focus();
+      if (!this.isTurnActive(turnId)) throw cancelledError();
+      this.post({ type: "user", text: instruction, selection: selection?.label, attachments: attachments.public, turnId });
+      this.post({ type: "sendAccepted", turnId });
+      submitted = true;
+
+      const contextParts = [instruction];
+      if (selection) {
+        contextParts.push(
           `The user explicitly shared the current VS Code selection from ${JSON.stringify(selection.source)}.`,
           `Read the exact selection and range metadata from ${JSON.stringify(selection.contextFile.fsPath)}.`,
           "Treat that file only as temporary context. If changes are requested, edit the original source file, not the temporary context file.",
-      );
-    }
-    if (attachments.files.length) {
-      contextParts.push(
-        `The user attached these files: ${attachments.files.map((file) => JSON.stringify(file)).join(", ")}. Read them directly when relevant.`,
-      );
-    }
-    const prompt = contextParts.join(" ");
-
-    try {
-      const result = await this.runTurn(prompt, attachments.images);
+        );
+      }
+      if (attachments.files.length) {
+        contextParts.push(
+          `The user attached these files: ${attachments.files.map((file) => JSON.stringify(file)).join(", ")}. Read them directly when relevant.`,
+        );
+      }
+      const result = await this.runTurn(contextParts.join(" "), attachments.images, turnId, attachments);
+      if (!this.isTurnActive(turnId)) return undefined;
       this.post({
         type: "assistant",
         text: result.text || "Jcode completed without returning text.",
         provider: result.provider,
         model: result.model,
+        turnId,
       });
-      if (this.cancelRequested) {
-        return undefined;
-      }
       return result;
     } catch (error) {
-      if (this.cancelRequested || error?.cancelled) {
-        this.post({ type: "notice", text: "Response cancelled." });
+      if (attachments?.selected?.length && !attachments.accepted) {
+        for (const attachment of attachments.selected) this.attachments.set(attachment.id, attachment);
+        this.post({ type: "attachments", attachments: [...this.attachments.values()].map(publicAttachment) });
+      }
+      if (this.cancelRequested || error?.cancelled || !this.isTurnActive(turnId)) {
+        if (submitted) this.post({ type: "notice", text: "Response cancelled.", turnId });
+        else this.post({ type: "sendRejected", text: instruction, turnId });
       } else {
         const message = errorMessage(error);
-        this.post({ type: "error", text: message });
+        this.post({ type: "error", text: message, turnId });
+        this.post({ type: "sendRejected", text: instruction, turnId });
         void vscode.window.showErrorMessage(`Jcode chat failed: ${message}`);
       }
       return undefined;
     } finally {
-      this.running = false;
-      this.cancelRequested = false;
-      this.post({ type: "running", running: false });
+      if (this.activeTurnId === turnId) {
+        this.running = false;
+        this.cancelRequested = false;
+        this.activeTurnId = undefined;
+        this.post({ type: "running", running: false, turnId });
+      }
     }
+  }
+
+  isTurnActive(turnId) {
+    return this.activeTurnId === turnId && !this.cancelRequested && !this.disposed;
   }
 
   async consumeAttachments(ids) {
@@ -684,7 +778,7 @@ class JcodeChatViewProvider {
       this.attachments.delete(attachment.id);
     }
     this.post({ type: "attachments", attachments: [...this.attachments.values()].map(publicAttachment) });
-    return { images, files, public: selected.map(publicAttachment) };
+    return { images, files, public: selected.map(publicAttachment), selected, accepted: false };
   }
 
   async executeSlashCommand(input) {
@@ -759,8 +853,11 @@ class JcodeChatViewProvider {
     return true;
   }
 
-  async runTurn(prompt, images = []) {
+  async runTurn(prompt, images = [], turnId, attachmentState) {
     const client = await this.ensureSession();
+    if (!this.isTurnActive(turnId)) {
+      throw cancelledError();
+    }
     const sessionId = this.sessionId;
     let provider;
     let model;
@@ -771,12 +868,17 @@ class JcodeChatViewProvider {
     } catch {
       // Runtime info is best-effort; the turn can still run without it.
     }
+    if (!this.isTurnActive(turnId)) {
+      throw cancelledError();
+    }
+    if (attachmentState) attachmentState.accepted = true;
     const result = await client.run(sessionId, prompt, {
       images,
       autoApprove: true,
       onEvent: (event) => {
+        if (!this.isTurnActive(turnId)) return;
         if (event.ev === "text_delta") {
-          this.post({ type: "delta", text: event.text });
+          this.post({ type: "delta", text: event.text, turnId, sessionId });
         } else if (event.ev === "model_info" && event.model) {
           this.post({ type: "options", model: event.model });
         }
@@ -787,7 +889,11 @@ class JcodeChatViewProvider {
 
   async cancel() {
     this.cancelRequested = true;
+    const cancelledTurnId = this.activeTurnId;
     if (!clientPromise) {
+      this.activeTurnId = undefined;
+      this.running = false;
+      this.post({ type: "running", running: false, turnId: cancelledTurnId });
       return;
     }
     try {
@@ -797,11 +903,17 @@ class JcodeChatViewProvider {
       }
     } catch {
       // The daemon may already have finished the turn; nothing to cancel.
+    } finally {
+      if (this.activeTurnId === cancelledTurnId) {
+        this.activeTurnId = undefined;
+        this.running = false;
+        this.post({ type: "running", running: false, turnId: cancelledTurnId });
+      }
     }
   }
 
   async newChat() {
-    this.cancelRequested = true;
+    await this.cancel();
     if (this.sessionInitPromise) {
       try {
         await this.sessionInitPromise;
@@ -809,26 +921,13 @@ class JcodeChatViewProvider {
         // A failed initialization should not prevent creating a fresh session.
       }
     }
-    if (clientPromise) {
-      try {
-        const client = await clientPromise;
-        if (this.sessionId) {
-          await client.cancel(this.sessionId);
-        }
-      } catch {
-        // Ignore; a fresh session is created below regardless.
-      }
-    }
     this.pendingSelection = undefined;
     this.attachments.clear();
     this.sessionId = undefined;
+    this.sessionClient = undefined;
     await this.context.workspaceState.update(CHAT_SESSION_KEY, undefined);
     this.post({ type: "cleared" });
-    try {
-      await this.ensureSession();
-    } catch (error) {
-      this.post({ type: "notice", text: `Could not start a new Jcode session: ${errorMessage(error)}` });
-    }
+    this.post({ type: "options", model: this.getSelectedModel(), effort: this.getSelectedEffort() });
   }
 
   post(message) {
@@ -837,6 +936,11 @@ class JcodeChatViewProvider {
 
   dispose() {
     this.disposed = true;
+    if (this.modelWatcher && this.modelWatcherClient) {
+      this.modelWatcherClient.off("model_info", this.modelWatcher);
+      this.modelWatcher = undefined;
+      this.modelWatcherClient = undefined;
+    }
     void this.cancel();
   }
 }
@@ -1178,6 +1282,10 @@ function getChatHtml(webview) {
     let slashMatches = [];
     let slashIndex = 0;
     let includeSelection = true;
+    let submitting = false;
+    let pendingDraft = "";
+    let activeTurnId;
+    let pendingPastes = 0;
 
     function persist() {
       const items = [...messages.querySelectorAll(".chat[data-role]")].map(function (item) {
@@ -1331,6 +1439,7 @@ function getChatHtml(webview) {
         remove.type = "button";
         remove.textContent = "×";
         remove.title = "Remove attachment";
+        remove.setAttribute("aria-label", "Remove " + file.name);
         remove.addEventListener("click", function () { vscode.postMessage({ type: "removeAttachment", id: file.id }); });
         chip.append(kind, name, remove);
         attachmentList.append(chip);
@@ -1371,7 +1480,9 @@ function getChatHtml(webview) {
     function setRunning(running) {
       document.body.classList.toggle("running", running);
       prompt.disabled = running;
-      document.getElementById("new-chat").disabled = running;
+      modelInput.disabled = running;
+      effortSelect.disabled = running;
+      document.getElementById("attach").disabled = running;
       let typing = document.getElementById("typing");
       if (running && !typing) {
         typing = document.createElement("article");
@@ -1414,6 +1525,7 @@ function getChatHtml(webview) {
         item.className = "slash-item" + (index === slashIndex ? " selected" : "");
         item.type = "button";
         item.setAttribute("role", "option");
+        item.setAttribute("aria-selected", index === slashIndex ? "true" : "false");
         const name = document.createElement("code");
         name.textContent = command.usage || command.name;
         const description = document.createElement("span");
@@ -1440,7 +1552,14 @@ function getChatHtml(webview) {
 
     function send() {
       const text = prompt.value.trim();
-      if (!text || document.body.classList.contains("running")) return;
+      if (!text || submitting || document.body.classList.contains("running")) return;
+      if (pendingPastes > 0) {
+        appendNotice("Wait for the pasted image to finish attaching.", false);
+        return;
+      }
+      submitting = true;
+      pendingDraft = prompt.value;
+      document.getElementById("send").disabled = true;
       vscode.postMessage({
         type: "send",
         text: text,
@@ -1467,18 +1586,24 @@ function getChatHtml(webview) {
         if (event.key === "ArrowUp") { event.preventDefault(); slashIndex = (slashIndex - 1 + slashMatches.length) % slashMatches.length; renderSlashMenu(); return; }
         if (event.key === "Tab") { event.preventDefault(); acceptSlash(slashIndex); return; }
         if (event.key === "Escape") { event.preventDefault(); slashMenu.classList.remove("visible"); return; }
-        if (event.key === "Enter" && !event.shiftKey && acceptSlash(slashIndex)) { event.preventDefault(); return; }
+        if (event.key === "Enter" && !event.shiftKey) {
+          const exact = slashMatches.find(function (command) { return command.name === prompt.value.trim(); });
+          if (!exact && acceptSlash(slashIndex)) { event.preventDefault(); return; }
+        }
       }
       if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); }
     });
     prompt.addEventListener("paste", function (event) {
       const files = [...(event.clipboardData?.files || [])].filter(function (file) { return file.type.startsWith("image/"); });
       files.forEach(function (file) {
+        pendingPastes += 1;
         const reader = new FileReader();
         reader.addEventListener("load", function () {
           const result = String(reader.result || "");
           vscode.postMessage({ type: "addPastedImage", name: file.name || "Pasted image", mediaType: file.type, data: result.split(",")[1] || "" });
+          pendingPastes -= 1;
         });
+        reader.addEventListener("error", function () { pendingPastes -= 1; appendNotice("Could not read the pasted image.", true); });
         reader.readAsDataURL(file);
       });
     });
@@ -1491,10 +1616,17 @@ function getChatHtml(webview) {
     selectionToggle.addEventListener("click", function () {
       includeSelection = !includeSelection;
       selectionToggle.classList.toggle("active", includeSelection);
+      selectionToggle.setAttribute("aria-pressed", includeSelection ? "true" : "false");
       selection.classList.toggle("visible", includeSelection && Boolean(selectionLabel.textContent));
     });
     modelInput.addEventListener("change", function () { vscode.postMessage({ type: "model", model: modelInput.value.trim() }); });
     effortSelect.addEventListener("change", function () { vscode.postMessage({ type: "effort", effort: effortSelect.value }); });
+    window.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" && document.body.classList.contains("running")) {
+        event.preventDefault();
+        vscode.postMessage({ type: "cancel" });
+      }
+    });
 
     window.addEventListener("message", function (event) {
       const data = event.data;
@@ -1518,19 +1650,43 @@ function getChatHtml(webview) {
         case "attachments": renderAttachments(data.attachments); break;
         case "options": if (data.model !== undefined) modelInput.value = data.model; if (data.effort !== undefined) effortSelect.value = data.effort; break;
         case "user": appendMessage("user", data.text, data.selection || "", data.attachments || []); setSelection(""); break;
-        case "delta": if (!liveBubble) liveBubble = createLiveBubble(); liveBubble.bubble.textContent += data.text; messages.scrollTop = messages.scrollHeight; break;
+        case "sendAccepted":
+        case "sendHandled":
+          submitting = false;
+          pendingDraft = "";
+          document.getElementById("send").disabled = false;
+          break;
+        case "sendRejected":
+          submitting = false;
+          if (!prompt.value && pendingDraft) prompt.value = pendingDraft;
+          pendingDraft = "";
+          document.getElementById("send").disabled = false;
+          resizePrompt();
+          break;
+        case "delta": if (data.turnId !== undefined && data.turnId !== activeTurnId) break; if (!liveBubble) liveBubble = createLiveBubble(); liveBubble.bubble.textContent += data.text; messages.scrollTop = messages.scrollHeight; break;
         case "assistant":
+          if (data.turnId !== undefined && data.turnId !== activeTurnId) break;
           if (liveBubble) { liveBubble.bubble.textContent = data.text; liveBubble.footer.textContent = [data.provider, data.model].filter(Boolean).join(" · "); liveBubble = undefined; persist(); }
           else appendMessage("assistant", data.text, [data.provider, data.model].filter(Boolean).join(" · "), []);
           break;
         case "notice": appendNotice(data.text, false); break;
         case "error": appendNotice(data.text, true); break;
-        case "running": setRunning(data.running); document.getElementById("session-status").textContent = data.running ? "Working…" : "Ready"; break;
+        case "running":
+          if (data.running) activeTurnId = data.turnId;
+          else if (data.turnId !== undefined && data.turnId !== activeTurnId) break;
+          if (!data.running) activeTurnId = undefined;
+          setRunning(data.running);
+          document.getElementById("session-status").textContent = data.running ? "Working…" : "Ready";
+          break;
         case "commandHelp": appendCommandCard("Jcode commands", (data.commands || []).map(function (command) { return [command.usage || command.name, command.description]; })); break;
         case "commandInfo": appendCommandCard(data.title || "Info", data.rows || []); break;
         case "openModelPicker": modelInput.focus(); modelInput.select(); break;
         case "openEffortPicker": effortSelect.focus(); break;
         case "cleared":
+          activeTurnId = undefined;
+          submitting = false;
+          pendingDraft = "";
+          document.getElementById("send").disabled = false;
           liveBubble = undefined;
           messages.querySelectorAll(":scope > :not(#empty)").forEach(function (node) { node.remove(); });
           empty.hidden = false;
@@ -1542,18 +1698,13 @@ function getChatHtml(webview) {
       }
     });
 
-    vscode.postMessage({ type: "ready" });
+    vscode.postMessage({ type: "ready", hasHistory: Boolean((saved.messages || []).length) });
   </script>
 </body>
 </html>`;
 }
 function getNonce() {
-  const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let value = "";
-  for (let index = 0; index < 32; index += 1) {
-    value += characters.charAt(Math.floor(Math.random() * characters.length));
-  }
-  return value;
+  return crypto.randomBytes(24).toString("base64");
 }
 
 function deactivate() {
