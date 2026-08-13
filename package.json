@@ -1,10 +1,20 @@
 {
   "name": "jcode-vscode",
   "displayName": "Jcode",
-  "description": "Run Jcode inside VS Code and send the active editor selection as context.",
-  "version": "0.1.0",
+  "description": "Chat with Jcode in the VS Code sidebar and send the active editor selection as context.",
+  "version": "0.2.0",
   "publisher": "jcode",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jinclaudio/jcode-vscode.git"
+  },
+  "files": [
+    "extension.js",
+    "media/",
+    "README.md",
+    "LICENSE"
+  ],
   "engines": {
     "vscode": "^1.95.0"
   },
@@ -24,7 +34,11 @@
     "commands": [
       {
         "command": "jcode.open",
-        "title": "Jcode: Open Agent"
+        "title": "Jcode: Open Chat"
+      },
+      {
+        "command": "jcode.openTerminal",
+        "title": "Jcode: Open Terminal Agent"
       },
       {
         "command": "jcode.askSelection",
@@ -39,6 +53,26 @@
         "title": "Jcode: Fix Selection"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "jcode",
+          "title": "Jcode",
+          "icon": "media/jcode.svg"
+        }
+      ]
+    },
+    "views": {
+      "jcode": [
+        {
+          "type": "webview",
+          "id": "jcode.chatView",
+          "name": "Chat",
+          "icon": "media/jcode.svg",
+          "contextualTitle": "Jcode Chat"
+        }
+      ]
+    },
     "menus": {
       "editor/context": [
         {
@@ -60,6 +94,9 @@
       "commandPalette": [
         {
           "command": "jcode.open"
+        },
+        {
+          "command": "jcode.openTerminal"
         },
         {
           "command": "jcode.askSelection"
@@ -94,7 +131,7 @@
             "type": "string"
           },
           "default": [],
-          "description": "Extra arguments passed when starting the interactive Jcode terminal."
+          "description": "Extra global arguments passed to Jcode chat runs and the interactive terminal."
         },
         "jcode.maxSelectionCharacters": {
           "type": "number",

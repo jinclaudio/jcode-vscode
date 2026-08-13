@@ -24,9 +24,13 @@ async function updateSetting(name, value) {
     .update(name, value, vscode.ConfigurationTarget.Global);
 }
 
+async function readInvocations(argsLog) {
+  const content = await fs.readFile(argsLog, "utf8");
+  return content.trim().split("\n").filter(Boolean).map((line) => line.split("\0"));
+}
+
 async function run() {
   const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "jcode-vscode-test-"));
-  const stdinLog = path.join(scratch, "stdin.log");
   const argsLog = path.join(scratch, "args.log");
   const fakeJcode = path.join(scratch, "fake-jcode.py");
   const sourceFile = path.join(scratch, "sample.js");
@@ -35,11 +39,15 @@ async function run() {
     fakeJcode,
     [
       "#!/usr/bin/env python3",
-      "import os, sys",
-      `open(${JSON.stringify(argsLog)}, 'a').write('\\0'.join(sys.argv[1:]) + '\\n')`,
-      `with open(${JSON.stringify(stdinLog)}, 'a', buffering=1) as output:`,
-      "    for line in sys.stdin:",
-      "        output.write(line)",
+      "import json, sys",
+      "args = sys.argv[1:]",
+      `open(${JSON.stringify(argsLog)}, 'a').write('\\0'.join(args) + '\\n')`,
+      "if 'run' in args:",
+      "    prompt = args[-1]",
+      "    print(json.dumps({'session_id': 'fake-session-1', 'provider': 'test-provider', 'model': 'test-model', 'text': 'FAKE_CHAT_RESPONSE: ' + prompt[:80]}))",
+      "    sys.exit(0)",
+      "for _line in sys.stdin:",
+      "    pass",
     ].join("\n"),
     { mode: 0o755 },
   );
@@ -53,16 +61,25 @@ async function run() {
   const commands = await vscode.commands.getCommands(true);
   for (const command of [
     "jcode.open",
+    "jcode.openTerminal",
     "jcode.askSelection",
     "jcode.explainSelection",
     "jcode.fixSelection",
+    "jcode._test.sendChat",
+    "jcode._test.newChat",
   ]) {
     assert.ok(commands.includes(command), `${command} must be registered`);
   }
 
+  const contribution = extension.packageJSON.contributes;
+  assert.equal(contribution.viewsContainers.activitybar[0].id, "jcode");
+  assert.equal(contribution.views.jcode[0].id, "jcode.chatView");
+  assert.equal(contribution.views.jcode[0].type, "webview");
+
   await updateSetting("executablePath", fakeJcode);
   await updateSetting("launchArguments", ["--provider", "test-provider"]);
   await updateSetting("maxSelectionCharacters", 200000);
+  await vscode.commands.executeCommand("jcode._test.newChat");
 
   const document = await vscode.workspace.openTextDocument(sourceFile);
   const editor = await vscode.window.showTextDocument(document);
@@ -72,18 +89,30 @@ async function run() {
     new vscode.Selection(1, 6, 1, 10),
   ];
 
-  await vscode.commands.executeCommand("jcode.explainSelection");
-  const prompt = await waitFor(async () => {
-    try {
-      const content = await fs.readFile(stdinLog, "utf8");
-      return content.includes("Explain this selected code") ? content : undefined;
-    } catch {
-      return undefined;
-    }
-  }, "selection prompt to reach the terminal process");
+  await vscode.commands.executeCommand("jcode.open");
+  const firstResult = await vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "Explain the selected identifiers.",
+    true,
+  );
+  assert.match(firstResult.text, /FAKE_CHAT_RESPONSE/);
+  assert.equal(firstResult.session_id, "fake-session-1");
 
-  assert.match(prompt, /sample\.js/);
-  const contextMatch = prompt.match(/Read the exact selection and range metadata from ("(?:[^"\\]|\\.)+")/);
+  let invocations = await readInvocations(argsLog);
+  const firstArgs = invocations[0];
+  assert.ok(firstArgs.includes("-C"));
+  assert.ok(firstArgs.includes(scratch));
+  assert.ok(firstArgs.includes("--provider"));
+  assert.ok(firstArgs.includes("test-provider"));
+  assert.ok(firstArgs.includes("run"));
+  assert.ok(firstArgs.includes("--json"));
+  assert.ok(firstArgs.includes("--no-update"));
+  assert.equal(firstArgs.includes("--resume"), false);
+
+  const firstPrompt = firstArgs.at(-1);
+  assert.match(firstPrompt, /Explain the selected identifiers/);
+  assert.match(firstPrompt, /sample\.js/);
+  const contextMatch = firstPrompt.match(/Read the exact selection and range metadata from ("(?:[^"\\]|\\.)+")/);
   assert.ok(contextMatch, "prompt must include a JSON-quoted context path");
   const contextPath = JSON.parse(contextMatch[1]);
   const contextText = await fs.readFile(contextPath, "utf8");
@@ -91,19 +120,23 @@ async function run() {
   assert.match(contextText, /Selection 1 \(L1:C7-L1:C12\)[\s\S]*alpha/);
   assert.match(contextText, /Selection 2 \(L2:C7-L2:C11\)[\s\S]*beta/);
 
-  const argsText = await fs.readFile(argsLog, "utf8");
-  const invocations = argsText.trim().split("\n").map((line) => line.split("\0"));
-  const firstArgs = invocations[0];
-  assert.deepEqual(firstArgs.slice(-2), ["--provider", "test-provider"]);
-  assert.ok(firstArgs.includes("-C"));
-  assert.ok(firstArgs.includes(scratch));
-  assert.deepEqual(invocations[1], ["transcript", "--mode", "send"]);
-
-  const sentLength = prompt.length;
   editor.selections = [new vscode.Selection(0, 0, 0, 0)];
+  const secondResult = await vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "Continue without attaching a selection.",
+    false,
+  );
+  assert.match(secondResult.text, /FAKE_CHAT_RESPONSE/);
+  invocations = await readInvocations(argsLog);
+  const secondArgs = invocations[1];
+  assert.ok(secondArgs.includes("--resume"));
+  assert.equal(secondArgs[secondArgs.indexOf("--resume") + 1], "fake-session-1");
+  assert.equal(secondArgs.at(-1), "Continue without attaching a selection.");
+
+  const invocationCount = invocations.length;
   await vscode.commands.executeCommand("jcode.explainSelection");
   await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.equal((await fs.readFile(stdinLog, "utf8")).length, sentLength);
+  assert.equal((await readInvocations(argsLog)).length, invocationCount);
 
   await updateSetting("maxSelectionCharacters", 1000);
   const largeDocument = await vscode.workspace.openTextDocument({
@@ -114,29 +147,41 @@ async function run() {
   largeEditor.selection = new vscode.Selection(0, 0, 0, 1200);
   await vscode.commands.executeCommand("jcode.fixSelection");
   await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.equal((await fs.readFile(stdinLog, "utf8")).length, sentLength);
+  assert.equal((await readInvocations(argsLog)).length, invocationCount);
 
-  const firstTerminal = vscode.window.terminals.find((terminal) => terminal.name === "Jcode");
-  assert.ok(firstTerminal, "Jcode terminal must be visible to VS Code");
+  await vscode.commands.executeCommand("jcode._test.newChat");
+  await vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "A fresh conversation.",
+    false,
+  );
+  invocations = await readInvocations(argsLog);
+  const freshArgs = invocations[2];
+  assert.equal(freshArgs.includes("--resume"), false);
+
+  await vscode.commands.executeCommand("jcode.openTerminal");
+  const firstTerminal = await waitFor(
+    () => vscode.window.terminals.find((terminal) => terminal.name === "Jcode"),
+    "Jcode terminal to be visible",
+  );
+  invocations = await waitFor(async () => {
+    const current = await readInvocations(argsLog);
+    return current.length >= 4 ? current : undefined;
+  }, "terminal process to start");
+  const terminalArgs = invocations[3];
+  assert.deepEqual(terminalArgs.slice(-2), ["--provider", "test-provider"]);
+  assert.ok(terminalArgs.includes("-C"));
+  assert.ok(terminalArgs.includes(scratch));
   firstTerminal.dispose();
   await waitFor(
     () => !vscode.window.terminals.includes(firstTerminal),
     "disposed terminal to close",
   );
-  await vscode.commands.executeCommand("jcode.open");
-  await waitFor(async () => {
-    const invocations = (await fs.readFile(argsLog, "utf8")).trim().split("\n");
-    return invocations.length >= 3;
-  }, "terminal to restart after disposal");
-
-  const restarted = vscode.window.terminals.find((terminal) => terminal.name === "Jcode");
-  restarted?.dispose();
-  await waitFor(() => !vscode.window.terminals.includes(restarted), "restarted terminal to close");
 
   await updateSetting("executablePath", "jcode");
   await updateSetting("launchArguments", ["--no-update"]);
   await vscode.window.showTextDocument(document);
-  await vscode.commands.executeCommand("jcode.open");
+  await vscode.commands.executeCommand("jcode.openTerminal");
   const realTerminal = await waitFor(
     () => vscode.window.terminals.find((terminal) => terminal.name === "Jcode"),
     "real Jcode terminal to be created",
@@ -158,6 +203,7 @@ async function run() {
   await updateSetting("executablePath", undefined);
   await updateSetting("launchArguments", undefined);
   await updateSetting("maxSelectionCharacters", undefined);
+  await vscode.commands.executeCommand("jcode._test.newChat");
   await vscode.commands.executeCommand("workbench.action.closeAllEditors");
   await fs.rm(scratch, { recursive: true, force: true });
 
