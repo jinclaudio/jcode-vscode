@@ -52,7 +52,7 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.9.0";
+const CLIENT_NAME = "jcode-vscode/0.9.1";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -743,6 +743,37 @@ function emptyRuntimeState(model, configuredLimit) {
   };
 }
 
+// DEMO (temporary): preview data for the runtime dashboard. Only affects
+// webview-bound messages, never the persisted runtime state. Remove this block
+// (and the webviewRuntimeState() call sites) once the UI has been reviewed.
+const RUNTIME_DEMO = true;
+const RUNTIME_DEMO_TODOS = [
+  { id: "t1", content: "Scan the workspace and map the module structure", status: "completed", priority: "high", group: "Investigate", confidence: "verified", completion_confidence: "verified" },
+  { id: "t2", content: "Locate the webview HTML template in extension.js", status: "completed", priority: "high", group: "Investigate", confidence: "validated", completion_confidence: "validated" },
+  { id: "t3", content: "Trace the runtimeState message flow from extension to chat.js", status: "in_progress", priority: "medium", group: "Investigate", confidence: "plausible" },
+  { id: "t4", content: "Reset the VS Code default 20px webview body padding", status: "completed", priority: "high", group: "Fix", confidence: "verified", completion_confidence: "verified" },
+  { id: "t5", content: "Preview the todo dashboard UI in the sidebar", status: "in_progress", priority: "high", group: "Fix", confidence: "speculative" },
+  { id: "t6", content: "Align the runtime panel inset with the composer box", status: "pending", priority: "low", group: "Polish", confidence: "plausible" },
+  { id: "t7", content: "Write an acceptance test for the runtime dashboard", status: "cancelled", priority: "low", group: "Polish", confidence: "speculative" },
+];
+
+function webviewRuntimeState(base) {
+  if (!RUNTIME_DEMO) return base;
+  return {
+    ...base,
+    todos: RUNTIME_DEMO_TODOS,
+    goals: [],
+    aggregateConfidence: aggregateTodoConfidence(RUNTIME_DEMO_TODOS),
+    inputTokens: 51200,
+    outputTokens: 18400,
+    cacheReadTokens: 112000,
+    effectiveInputTokens: 158000,
+    contextTokens: 158000,
+    contextLimit: 200000,
+    activeModel: base.activeModel || "jcode-demo",
+  };
+}
+
 class JcodeChatProvider {
   /** @param {vscode.ExtensionContext} context */
   constructor(context) {
@@ -990,7 +1021,7 @@ class JcodeChatProvider {
       effort: this.getSelectedEffort(),
       slashCommands: SLASH_COMMANDS.filter((command) => !command.hidden),
       attachments: [...this.attachments.values()].map(publicAttachment),
-      runtimeState: this.runtimeState,
+      runtimeState: webviewRuntimeState(this.runtimeState),
     });
   }
 
@@ -1182,7 +1213,7 @@ class JcodeChatProvider {
       effort: this.getSelectedEffort(),
       slashCommands: SLASH_COMMANDS.filter((command) => !command.hidden),
       attachments: [...this.attachments.values()].map(publicAttachment),
-      runtimeState: this.runtimeState,
+      runtimeState: webviewRuntimeState(this.runtimeState),
       error,
     });
   }
@@ -2117,13 +2148,13 @@ function getChatHtml(webview, context) {
     <footer class="composer-zone">
       <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash commands"></div>
       <section id="runtime-popover" class="runtime-popover" aria-label="Jcode agent status details" hidden>
-        <div class="runtime-heading"><span>Agent status</span><span id="todo-summary" class="runtime-summary"></span></div>
+        <div class="runtime-heading"><span id="runtime-title">Agent status</span><span id="todo-summary" class="runtime-summary" data-runtime-content="todo"></span></div>
         <div class="runtime-metrics">
-          <div class="runtime-metric" title="Aggregate todo confidence"><div class="metric-label"><span>Confidence</span><strong id="confidence-value">—</strong></div><div class="metric-track"><i id="confidence-bar"></i></div></div>
-          <div class="runtime-metric" title="Session KV cache read hit rate"><div class="metric-label"><span>KV cache</span><strong id="cache-value">—</strong></div><div class="metric-track"><i id="cache-bar"></i></div></div>
-          <div class="runtime-metric" title="Latest observed prompt size versus the model context window"><div class="metric-label"><span>Context</span><strong id="context-value">—</strong></div><div class="metric-track"><i id="context-bar"></i></div></div>
+          <div class="runtime-metric" data-runtime-content="confidence" title="Aggregate todo confidence"><div class="metric-label"><span>Confidence</span><strong id="confidence-value">—</strong></div><div class="metric-track"><i id="confidence-bar"></i></div></div>
+          <div class="runtime-metric" data-runtime-content="cache" title="Session KV cache read hit rate"><div class="metric-label"><span>KV cache</span><strong id="cache-value">—</strong></div><div class="metric-track"><i id="cache-bar"></i></div></div>
+          <div class="runtime-metric" data-runtime-content="context" title="Latest observed prompt size versus the model context window"><div class="metric-label"><span>Context</span><strong id="context-value">—</strong></div><div class="metric-track"><i id="context-bar"></i></div></div>
         </div>
-        <div id="todo-list" class="todo-list"></div>
+        <div id="todo-list" class="todo-list" data-runtime-content="todo"></div>
       </section>
       <div id="selection" class="selection-chip" title=""><span>⌁</span><span id="selection-label"></span></div>
       <div class="composer">
@@ -2134,10 +2165,10 @@ function getChatHtml(webview, context) {
             <button id="attach" class="small-btn" type="button" title="Attach files or images"><svg viewBox="0 0 24 24"><path d="M12 17V7a4 4 0 0 1 8 0v9a7 7 0 0 1-14 0V6a2 2 0 0 1 4 0v10a3 3 0 0 0 6 0V8"/></svg><span>Attach</span></button>
             <button id="selection-toggle" class="small-btn active" type="button" title="Include current editor selection"><svg viewBox="0 0 24 24"><path d="M8 5H5v3M16 5h3v3M8 19H5v-3M16 19h3v-3M9 9h6v6H9z"/></svg><span>Selection</span></button>
             <div id="runtime-indicators" class="runtime-indicators" hidden>
-              <button id="todo-indicator" class="runtime-indicator" type="button" aria-label="Show todos" title="Todos"><svg viewBox="0 0 16 16"><path d="M2.5 4.5 4 6l2.5-3M8 4.5h5M2.5 10 4 11.5l2.5-3M8 10h5"/></svg><span id="todo-count" class="indicator-badge"></span></button>
-              <button id="confidence-indicator" class="runtime-indicator" type="button" aria-label="Show confidence" title="Confidence"><svg viewBox="0 0 16 16"><path d="m8 1.8 4.8 3.1v4.3c0 2.3-1.9 4-4.8 5-2.9-1-4.8-2.7-4.8-5V4.9L8 1.8Z"/><path d="m5.7 8 1.5 1.5 3.1-3.2"/></svg></button>
-              <button id="cache-indicator" class="runtime-indicator" type="button" aria-label="Show KV cache rate" title="KV cache"><svg viewBox="0 0 16 16"><ellipse cx="8" cy="3.5" rx="4.8" ry="2"/><path d="M3.2 3.5v4c0 1.1 2.1 2 4.8 2s4.8-.9 4.8-2v-4M3.2 7.5v4c0 1.1 2.1 2 4.8 2s4.8-.9 4.8-2v-4"/></svg></button>
-              <button id="context-indicator" class="runtime-indicator" type="button" aria-label="Show context usage" title="Context"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 2.5V8l3.8 2.2"/></svg></button>
+              <button id="todo-indicator" class="runtime-indicator" data-runtime-panel="todo" type="button" aria-label="Show todos" title="Todos"><svg viewBox="0 0 16 16"><path d="M2.5 4.5 4 6l2.5-3M8 4.5h5M2.5 10 4 11.5l2.5-3M8 10h5"/></svg><span id="todo-count" class="indicator-badge"></span></button>
+              <button id="confidence-indicator" class="runtime-indicator" data-runtime-panel="confidence" type="button" aria-label="Show confidence" title="Confidence"><svg viewBox="0 0 16 16"><path d="m8 1.8 4.8 3.1v4.3c0 2.3-1.9 4-4.8 5-2.9-1-4.8-2.7-4.8-5V4.9L8 1.8Z"/><path d="m5.7 8 1.5 1.5 3.1-3.2"/></svg></button>
+              <button id="cache-indicator" class="runtime-indicator" data-runtime-panel="cache" type="button" aria-label="Show KV cache rate" title="KV cache"><svg viewBox="0 0 16 16"><ellipse cx="8" cy="3.5" rx="4.8" ry="2"/><path d="M3.2 3.5v4c0 1.1 2.1 2 4.8 2s4.8-.9 4.8-2v-4M3.2 7.5v4c0 1.1 2.1 2 4.8 2s4.8-.9 4.8-2v-4"/></svg></button>
+              <button id="context-indicator" class="runtime-indicator" data-runtime-panel="context" type="button" aria-label="Show context usage" title="Context"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 2.5V8l3.8 2.2"/></svg></button>
             </div>
           </div>
           <div class="tool-right">
