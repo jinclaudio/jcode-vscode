@@ -25,7 +25,11 @@ and lets the user explicitly send editor selections to the agent.
   with the command prefilled, e.g. `/login`, `/update`, `/permissions`). Prefix
   a prompt with `//` when it must begin with a literal `/`.
 - The sidebar chat renders streaming text, collapsible reasoning, tool-call
-  rows, and token usage, and surfaces permission requests when the bridge
+  rows, and token usage. Its Agent status panel mirrors live Todo updates with
+  per-item and aggregate confidence, session KV-cache hit rate, and the latest
+  observed context occupancy. State is retained per session and context-window
+  inference follows Jcode's model-family defaults (overridable with
+  `jcode.contextWindowTokens`). Permission requests are surfaced when the bridge
   advertises the `permissions` capability.
 - With `jcode.shareEditorContext` (default on), each message includes a compact
   summary of the active editor, selection, open files, dirty files, and
@@ -37,8 +41,9 @@ and lets the user explicitly send editor selections to the agent.
   `npm run check:webview` instead of failing silently at runtime.
 - The Chat page uses a compact Claude Code-inspired layout with a floating composer,
   starter prompts, attachment chips, command cards, and live connection status.
-- The Chat page has a model picker populated from Jcode's live model catalog and a
-  reasoning-effort selector (`none` … `max`, subject to what the provider accepts).
+- The Chat page has a VS Code native Quick Pick populated from Jcode's live model
+  catalog and grouped by SDK route provider, plus a reasoning-effort selector
+  (`none` … `max`, subject to what the provider accepts).
   Choices persist per workspace and are applied to the chat session through the
   Jcode SDK (`listModels` / `setModel` / `setReasoningEffort`), and to the terminal
   agent through `-m` and the reasoning-effort environment variables.

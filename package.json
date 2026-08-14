@@ -2,7 +2,7 @@
   "name": "jcode-vscode",
   "displayName": "Jcode",
   "description": "Full Jcode agent wrapper: sidebar chat, editor context, session management, and slash commands over the official jcode SDK (api-bridge).",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "publisher": "jcode",
   "license": "MIT",
   "repository": {
@@ -139,6 +139,12 @@
           "default": 200000,
           "minimum": 1000,
           "description": "Maximum number of selected characters that may be sent to Jcode."
+        },
+        "jcode.contextWindowTokens": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "markdownDescription": "Override the context window used by the sidebar occupancy meter. `0` uses Jcode's model-family defaults (normally 200K, with known long-context models detected automatically)."
         },
         "jcode.defaultModel": {
           "type": "string",

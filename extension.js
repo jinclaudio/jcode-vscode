@@ -26,6 +26,7 @@ const CHAT_SESSION_KEY = "jcode.chat.sessionId";
 const CHAT_MODEL_KEY = "jcode.chat.model";
 const CHAT_EFFORT_KEY = "jcode.chat.effort";
 const CHAT_BOOKMARKS_KEY = "jcode.chat.bookmarks";
+const CHAT_RUNTIME_STATES_KEY = "jcode.chat.runtimeStates";
 const MAX_SELECTION_SNAPSHOTS = 20;
 const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const DEFAULT_MODELS = [
@@ -50,7 +51,7 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.7.0";
+const CLIENT_NAME = "jcode-vscode/0.8.0";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -619,6 +620,71 @@ function buildModelQuickPickItems(models, routes, current) {
   return items;
 }
 
+const CONFIDENCE_LEVELS = ["speculative", "plausible", "validated", "verified"];
+
+function displayTodoConfidence(todo) {
+  return todo?.status === "completed"
+    ? todo.completion_confidence || todo.confidence
+    : todo?.confidence;
+}
+
+function aggregateTodoConfidence(todos) {
+  let weightedScore = 0;
+  let totalWeight = 0;
+  for (const todo of todos || []) {
+    if (!todo || todo.status === "cancelled") continue;
+    const confidence = displayTodoConfidence(todo);
+    const score = CONFIDENCE_LEVELS.indexOf(confidence);
+    if (score < 0) continue;
+    const weight = todo.priority === "high" ? 3 : todo.priority === "medium" ? 2 : 1;
+    weightedScore += score * weight;
+    totalWeight += weight;
+  }
+  return totalWeight > 0
+    ? CONFIDENCE_LEVELS[Math.max(0, Math.min(3, Math.round(weightedScore / totalWeight)))]
+    : undefined;
+}
+
+function effectivePromptTokens(input, cacheRead) {
+  const safeInput = Math.max(0, Number(input) || 0);
+  const safeCacheRead = Math.max(0, Number(cacheRead) || 0);
+  return safeCacheRead > safeInput ? safeInput + safeCacheRead : safeInput;
+}
+
+function inferredContextLimit(model, configuredLimit = 0) {
+  if (Number(configuredLimit) > 0) return Number(configuredLimit);
+  const name = String(model || "").toLowerCase().replace(/^.*[/:]/, "");
+  if (name.includes("[1m]") || /claude-(opus-(5|4-8|4-7)|sonnet-5|fable-5)/.test(name)) return 1_000_000;
+  if (name.startsWith("gpt-5.4")) return 1_000_000;
+  if (name.startsWith("gpt-5")) return name.includes("chat") || name.includes("spark") ? 128_000 : 272_000;
+  if (name.startsWith("gemini-2") || name.startsWith("gemini-3")) return 1_000_000;
+  if (name.includes("deepseek-v4") || name.includes("glm-5.2")) return 1_000_000;
+  if (name.includes("kimi") || /^k\d/.test(name)) return /(?:k3|k[4-9])/.test(name) ? 1_048_576 : 262_144;
+  if (name.includes("qwen3") || name.includes("qwen-3") || name.includes("mimo")) return 262_144;
+  if (name.includes("minimax")) return 204_800;
+  if (name.includes("grok-code-fast")) return 256_000;
+  return 200_000;
+}
+
+function isTodoToolName(name) {
+  return String(name || "").split(".").pop() === "todo";
+}
+
+function emptyRuntimeState(model, configuredLimit) {
+  return {
+    todos: [],
+    goals: [],
+    aggregateConfidence: undefined,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    effectiveInputTokens: 0,
+    contextTokens: 0,
+    contextLimit: inferredContextLimit(model, configuredLimit),
+    activeModel: model || undefined,
+  };
+}
+
 class JcodeChatProvider {
   /** @param {vscode.ExtensionContext} context */
   constructor(context) {
@@ -633,6 +699,7 @@ class JcodeChatProvider {
     this.modelWatcher = undefined;
     this.modelWatcherClient = undefined;
     this.modelCatalog = { models: this.getModelList(), routes: [] };
+    this.runtimeState = this.loadRuntimeState(this.context.workspaceState.get(CHAT_SESSION_KEY));
     this.disposed = false;
     this.nextTurnId = 1;
     this.activeTurnId = undefined;
@@ -742,6 +809,66 @@ class JcodeChatProvider {
     return vscode.workspace.getConfiguration("jcode").get("defaultEffort", "");
   }
 
+  configuredContextLimit() {
+    return vscode.workspace.getConfiguration("jcode").get("contextWindowTokens", 0);
+  }
+
+  loadRuntimeState(sessionId) {
+    const states = this.context.workspaceState.get(CHAT_RUNTIME_STATES_KEY, {});
+    const saved = sessionId && states && typeof states === "object" ? states[sessionId] : undefined;
+    return saved && typeof saved === "object"
+      ? { ...emptyRuntimeState(this.getSelectedModel(), this.configuredContextLimit()), ...saved }
+      : emptyRuntimeState(this.getSelectedModel(), this.configuredContextLimit());
+  }
+
+  async publishRuntimeState() {
+    this.runtimeState.contextLimit = inferredContextLimit(
+      this.runtimeState.activeModel || this.getSelectedModel(),
+      this.configuredContextLimit(),
+    );
+    if (this.sessionId) {
+      const states = { ...this.context.workspaceState.get(CHAT_RUNTIME_STATES_KEY, {}) };
+      states[this.sessionId] = this.runtimeState;
+      const sessionIds = Object.keys(states);
+      while (sessionIds.length > 20) delete states[sessionIds.shift()];
+      await this.context.workspaceState.update(CHAT_RUNTIME_STATES_KEY, states);
+    }
+    this.post({ type: "runtimeState", state: this.runtimeState });
+  }
+
+  updateRuntimeTodos(payload) {
+    if (!payload || typeof payload !== "object") return;
+    if (Array.isArray(payload.todos)) {
+      this.runtimeState.todos = payload.todos.slice(0, 100).map((todo) => ({
+        id: String(todo?.id || ""),
+        content: String(todo?.content || "").slice(0, 1000),
+        status: String(todo?.status || "pending"),
+        priority: String(todo?.priority || "normal"),
+        group: todo?.group == null ? undefined : String(todo.group).slice(0, 200),
+        confidence: todo?.confidence || undefined,
+        completion_confidence: todo?.completion_confidence || todo?.completionConfidence || undefined,
+      }));
+    }
+    if (Array.isArray(payload.goals)) this.runtimeState.goals = payload.goals.slice(0, 50);
+    this.runtimeState.aggregateConfidence = aggregateTodoConfidence(this.runtimeState.todos);
+    void this.publishRuntimeState();
+  }
+
+  updateRuntimeUsage(event, model) {
+    const input = Math.max(0, Number(event?.input) || 0);
+    const output = Math.max(0, Number(event?.output) || 0);
+    const cacheRead = Math.max(0, Number(event?.cache_read_input ?? event?.cacheReadInput) || 0);
+    const effectiveInput = effectivePromptTokens(input, cacheRead);
+    this.runtimeState.inputTokens += input;
+    this.runtimeState.outputTokens += output;
+    this.runtimeState.cacheReadTokens += cacheRead;
+    this.runtimeState.effectiveInputTokens += effectiveInput;
+    this.runtimeState.contextTokens = effectiveInput;
+    if (model) this.runtimeState.activeModel = model;
+    this.runtimeState.contextLimit = inferredContextLimit(model || this.getSelectedModel(), this.configuredContextLimit());
+    void this.publishRuntimeState();
+  }
+
   async showModelPicker() {
     if (this.running) {
       this.post({ type: "notice", text: "Cancel the active response before changing models." });
@@ -797,6 +924,7 @@ class JcodeChatProvider {
       effort: this.getSelectedEffort(),
       slashCommands: SLASH_COMMANDS.filter((command) => !command.hidden),
       attachments: [...this.attachments.values()].map(publicAttachment),
+      runtimeState: this.runtimeState,
     });
   }
 
@@ -961,6 +1089,7 @@ class JcodeChatProvider {
         models: models.length > 0 ? models : this.getModelList(),
         routes,
       };
+      this.runtimeState = this.loadRuntimeState(sessionId);
       this.watchModel(client);
     } catch (caught) {
       error = errorMessage(caught);
@@ -975,6 +1104,7 @@ class JcodeChatProvider {
       effort: this.getSelectedEffort(),
       slashCommands: SLASH_COMMANDS.filter((command) => !command.hidden),
       attachments: [...this.attachments.values()].map(publicAttachment),
+      runtimeState: this.runtimeState,
       error,
     });
   }
@@ -1530,6 +1660,7 @@ class JcodeChatProvider {
     const sessionId = this.sessionId;
     let provider;
     let model;
+    const toolInputs = new Map();
     try {
       const runtime = await client.getRuntimeInfo(sessionId);
       provider = runtime.provider;
@@ -1555,16 +1686,59 @@ class JcodeChatProvider {
             this.post({ type: "reasoning", text: event.text, turnId, sessionId });
             break;
           case "tool_start":
-            this.post({ type: "tool", kind: "start", name: event.name, detail: event.input ? JSON.stringify(event.input) : "", turnId });
+            toolInputs.set(event.call_id, { name: event.name, input: "", captured: false });
+            this.post({ type: "tool", kind: "start", name: event.name, detail: "", turnId });
             break;
+          case "tool_input_delta": {
+            const call = toolInputs.get(event.call_id) || { name: "", input: "", captured: false };
+            call.input += event.delta || "";
+            toolInputs.set(event.call_id, call);
+            break;
+          }
+          case "tool_exec": {
+            const call = toolInputs.get(event.call_id);
+            if (call && isTodoToolName(event.name || call.name) && !call.captured) {
+              try {
+                this.updateRuntimeTodos(JSON.parse(call.input));
+                call.captured = true;
+              } catch {
+                // Some providers finish streaming tool JSON only at tool_done.
+              }
+            }
+            break;
+          }
           case "tool_done":
+            {
+              const call = toolInputs.get(event.call_id);
+              if (call && isTodoToolName(event.name || call.name) && !call.captured) {
+                try {
+                  this.updateRuntimeTodos(JSON.parse(call.input));
+                } catch {
+                  // Invalid or unavailable tool input cannot update the dashboard.
+                }
+              }
+              toolInputs.delete(event.call_id);
+            }
             this.post({ type: "tool", kind: "done", name: event.name, detail: event.output ? String(event.output).slice(0, 500) : "", error: Boolean(event.error), turnId });
             break;
           case "token_usage":
-            this.post({ type: "usage", usage: event, turnId });
+            this.updateRuntimeUsage(event, model);
+            this.post({
+              type: "usage",
+              usage: {
+                input: event.input,
+                output: event.output,
+                cacheReadInput: event.cache_read_input ?? event.cacheReadInput,
+              },
+              turnId,
+            });
             break;
           case "model_info":
             if (event.model) {
+              model = event.model;
+              this.runtimeState.activeModel = event.model;
+              this.runtimeState.contextLimit = inferredContextLimit(event.model, this.configuredContextLimit());
+              void this.publishRuntimeState();
               this.post({ type: "options", model: event.model });
             }
             break;
@@ -1608,8 +1782,10 @@ class JcodeChatProvider {
     this.sessionClient = undefined;
     this.sessionInitPromise = undefined;
     this.attachments.clear();
+    this.runtimeState = emptyRuntimeState(this.getSelectedModel(), this.configuredContextLimit());
     await this.context.workspaceState.update(CHAT_SESSION_KEY, undefined);
     this.post({ type: "cleared" });
+    this.post({ type: "runtimeState", state: this.runtimeState });
     this.post({ type: "notice", text: "New chat. The next message creates a fresh session." });
   }
 
@@ -1854,6 +2030,15 @@ function getChatHtml(webview, context) {
     </section>
     <footer class="composer-zone">
       <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash commands"></div>
+      <section id="runtime-panel" class="runtime-panel" aria-label="Jcode agent status" hidden>
+        <div class="runtime-heading"><span>Agent status</span><span id="todo-summary" class="runtime-summary"></span></div>
+        <div class="runtime-metrics">
+          <div class="runtime-metric" title="Aggregate todo confidence"><div class="metric-label"><span>Confidence</span><strong id="confidence-value">—</strong></div><div class="metric-track"><i id="confidence-bar"></i></div></div>
+          <div class="runtime-metric" title="Session KV cache read hit rate"><div class="metric-label"><span>KV cache</span><strong id="cache-value">—</strong></div><div class="metric-track"><i id="cache-bar"></i></div></div>
+          <div class="runtime-metric" title="Latest observed prompt size versus the model context window"><div class="metric-label"><span>Context</span><strong id="context-value">—</strong></div><div class="metric-track"><i id="context-bar"></i></div></div>
+        </div>
+        <div id="todo-list" class="todo-list"></div>
+      </section>
       <div id="selection" class="selection-chip" title=""><span>⌁</span><span id="selection-label"></span></div>
       <div class="composer">
         <div id="attachments" class="pending-attachments"></div>

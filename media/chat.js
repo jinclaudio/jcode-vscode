@@ -23,6 +23,9 @@
   var modelLabel = document.getElementById("model-label");
   var effortSelect = document.getElementById("effort");
   var sessionStatus = document.getElementById("session-status");
+  var runtimePanel = document.getElementById("runtime-panel");
+  var todoSummary = document.getElementById("todo-summary");
+  var todoList = document.getElementById("todo-list");
 
   var saved = vscode.getState() || { messages: [] };
   var liveBubble;
@@ -277,6 +280,89 @@
       attachmentList.append(chip);
     });
     attachmentList.classList.toggle("visible", attachments.length > 0);
+  }
+
+  function formatTokens(value) {
+    var amount = Math.max(0, Number(value) || 0);
+    if (amount >= 1000000) return (amount / 1000000).toFixed(amount >= 10000000 ? 0 : 1) + "M";
+    if (amount >= 1000) return (amount / 1000).toFixed(amount >= 100000 ? 0 : 1) + "k";
+    return String(Math.round(amount));
+  }
+
+  function setMetric(valueId, barId, text, ratio, confidence) {
+    var value = document.getElementById(valueId);
+    var bar = document.getElementById(barId);
+    value.textContent = text;
+    bar.style.width = Math.max(0, Math.min(100, (Number(ratio) || 0) * 100)) + "%";
+    if (confidence) {
+      value.dataset.confidence = confidence;
+      bar.dataset.confidence = confidence;
+    } else {
+      delete value.dataset.confidence;
+      delete bar.dataset.confidence;
+    }
+  }
+
+  function todoConfidence(todo) {
+    return todo.status === "completed"
+      ? todo.completion_confidence || todo.confidence
+      : todo.confidence;
+  }
+
+  function renderRuntimeState(state) {
+    state = state || {};
+    var todos = Array.isArray(state.todos) ? state.todos : [];
+    var hasUsage = Number(state.effectiveInputTokens) > 0 || Number(state.contextTokens) > 0;
+    runtimePanel.hidden = todos.length === 0 && !hasUsage;
+
+    var completed = todos.filter(function (todo) { return todo.status === "completed"; }).length;
+    todoSummary.textContent = todos.length ? completed + "/" + todos.length + " done" : "";
+
+    var confidence = state.aggregateConfidence || "unknown";
+    var confidenceIndex = ["speculative", "plausible", "validated", "verified"].indexOf(confidence);
+    setMetric("confidence-value", "confidence-bar", confidence === "unknown" ? "—" : confidence, (confidenceIndex + 1) / 4, confidence);
+
+    var effectiveInput = Math.max(0, Number(state.effectiveInputTokens) || 0);
+    var cacheRead = Math.max(0, Number(state.cacheReadTokens) || 0);
+    var cacheRatio = effectiveInput > 0 ? cacheRead / effectiveInput : 0;
+    setMetric("cache-value", "cache-bar", effectiveInput > 0 ? Math.round(Math.min(1, cacheRatio) * 100) + "%" : "—", cacheRatio);
+
+    var contextTokens = Math.max(0, Number(state.contextTokens) || 0);
+    var contextLimit = Math.max(1, Number(state.contextLimit) || 200000);
+    setMetric(
+      "context-value",
+      "context-bar",
+      contextTokens > 0 ? formatTokens(contextTokens) + "/" + formatTokens(contextLimit) : "—",
+      contextTokens / contextLimit
+    );
+
+    todoList.replaceChildren();
+    var previousGroup;
+    todos.forEach(function (todo) {
+      var group = todo.group || "";
+      if (group && group !== previousGroup) {
+        var groupLabel = document.createElement("div");
+        groupLabel.className = "todo-group";
+        groupLabel.textContent = group;
+        todoList.append(groupLabel);
+      }
+      previousGroup = group;
+      var row = document.createElement("div");
+      row.className = "todo-item todo-" + (todo.status || "pending");
+      var status = document.createElement("span");
+      status.className = "todo-status";
+      status.textContent = todo.status === "completed" ? "✓" : todo.status === "in_progress" ? "▶" : todo.status === "cancelled" ? "×" : "○";
+      var content = document.createElement("span");
+      content.className = "todo-content";
+      content.textContent = todo.content || todo.id || "Untitled todo";
+      var itemConfidence = todoConfidence(todo);
+      var badge = document.createElement("span");
+      badge.className = "confidence-badge";
+      badge.dataset.confidence = itemConfidence || "unknown";
+      badge.textContent = itemConfidence || "?";
+      row.append(status, content, badge);
+      todoList.append(row);
+    });
   }
 
   function applyModelState(models, selected) {
@@ -545,6 +631,7 @@
       case "restore":
         setSelection(data.selection);
         applyOptions(data);
+        renderRuntimeState(data.runtimeState);
         slashCommands = data.slashCommands || [];
         renderAttachments(data.attachments || []);
         sessionStatus.textContent = data.error ? "Disconnected" : "Ready";
@@ -556,6 +643,7 @@
       case "bootstrap":
         setSelection(data.selection);
         applyOptions(data);
+        renderRuntimeState(data.runtimeState);
         slashCommands = data.slashCommands || [];
         renderAttachments(data.attachments || []);
         sessionStatus.textContent = "Connecting…";
@@ -576,6 +664,9 @@
         if (data.effort !== undefined) {
           effortSelect.value = data.effort;
         }
+        break;
+      case "runtimeState":
+        renderRuntimeState(data.state);
         break;
       case "user":
         if (data.turnId !== undefined) {

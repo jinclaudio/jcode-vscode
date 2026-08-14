@@ -54,6 +54,17 @@ def send_message(conn, frame):
     if "WAIT_FOR_CANCEL" in content:
         state.setdefault("pending", []).append((conn, sid))
         return
+    if "SHOW_METRICS" in content:
+        todo_input = json.dumps({"todos": [
+            {"id": "live", "content": "Implement live dashboard", "status": "in_progress", "priority": "high", "group": "metrics", "confidence": "plausible"},
+            {"id": "tested", "content": "Validate metric calculations", "status": "completed", "priority": "low", "group": "metrics", "confidence": "validated", "completion_confidence": "verified"}
+        ]})
+        emit(conn, {"v": 1, "ev": "tool_start", "session_id": sid, "call_id": "todo-1", "name": "todo"})
+        emit(conn, {"v": 1, "ev": "tool_input_delta", "session_id": sid, "call_id": "todo-1", "delta": todo_input[:len(todo_input)//2]})
+        emit(conn, {"v": 1, "ev": "tool_input_delta", "session_id": sid, "call_id": "todo-1", "delta": todo_input[len(todo_input)//2:]})
+        emit(conn, {"v": 1, "ev": "tool_exec", "session_id": sid, "call_id": "todo-1", "name": "todo"})
+        emit(conn, {"v": 1, "ev": "tool_done", "session_id": sid, "call_id": "todo-1", "name": "todo", "output": "ok"})
+        emit(conn, {"v": 1, "ev": "token_usage", "session_id": sid, "input": 250, "output": 100, "cache_read_input": 750})
     text = "FAKE_CHAT_RESPONSE: " + content[:80]
     emit(conn, {"v": 1, "ev": "text_delta", "session_id": sid, "text": text})
     emit(conn, {"v": 1, "ev": "turn_done", "session_id": sid})
@@ -260,6 +271,18 @@ async function run() {
     "the first sidebar message must reach the webview in usable order",
   );
 
+  await vscode.commands.executeCommand("jcode._test.sendChat", "SHOW_METRICS", false);
+  const metricMessages = await vscode.commands.executeCommand("jcode._test.getPostedMessages");
+  const runtimeState = metricMessages.filter((message) => message.type === "runtimeState").at(-1)?.state;
+  assert.ok(runtimeState, "token and todo events must publish a runtime dashboard state");
+  assert.equal(runtimeState.todos.length, 2);
+  assert.equal(runtimeState.aggregateConfidence, "validated");
+  assert.equal(runtimeState.inputTokens, 250);
+  assert.equal(runtimeState.cacheReadTokens, 750);
+  assert.equal(runtimeState.effectiveInputTokens, 1000);
+  assert.equal(runtimeState.contextTokens, 1000);
+  assert.equal(runtimeState.contextLimit, 200000);
+
   const document = await vscode.workspace.openTextDocument(sourceFile);
   const editor = await vscode.window.showTextDocument(document);
   await editor.edit((builder) => builder.insert(new vscode.Position(2, 0), "// unsaved\n"));
@@ -279,6 +302,7 @@ async function run() {
 
   const webviewSource = fsSync.readFileSync(path.join(__dirname, "../../extension.js"), "utf8");
   assert.match(webviewSource, /<button id="model"/, "the model catalog must use a visible VS Code picker button");
+  assert.match(webviewSource, /id="runtime-panel"/, "the sidebar must include the runtime metrics and todo panel");
   assert.match(webviewSource, /QuickPickItemKind\.Separator/, "the model picker must group models by provider");
   const pickerItems = await vscode.commands.executeCommand(
     "jcode._test.getModelPickerItems",
