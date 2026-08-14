@@ -1,3 +1,18 @@
+// jcode VS Code extension.
+//
+// Full wrapper around the jcode harness API (protocol v1), served by
+// `jcode api-bridge` over a Unix socket. The official TypeScript SDK
+// (@1jehuang/jcode-sdk) is bundled with the extension; the bridge is started
+// automatically the first time it is needed and shared with the user's own
+// jcode, so sessions created here are the same ones the terminal TUI shows.
+//
+// Layout:
+//   extension.js   this file: activation, connection manager, chat provider
+//   media/chat.js  webview client (external file, syntax-checkable)
+//   media/chat.css webview styles
+//   media/chat.html is generated inline by getChatHtml() below (small shell
+//   that references the external assets via webview.asWebviewUri).
+
 const path = require("node:path");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -10,6 +25,7 @@ const CHAT_VIEW_ID = "jcode.chatView";
 const CHAT_SESSION_KEY = "jcode.chat.sessionId";
 const CHAT_MODEL_KEY = "jcode.chat.model";
 const CHAT_EFFORT_KEY = "jcode.chat.effort";
+const CHAT_BOOKMARKS_KEY = "jcode.chat.bookmarks";
 const MAX_SELECTION_SNAPSHOTS = 20;
 const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const DEFAULT_MODELS = [
@@ -34,7 +50,7 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.5.1";
+const CLIENT_NAME = "jcode-vscode/0.6.0";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -45,27 +61,147 @@ const IMAGE_MEDIA_TYPES = new Map([
   [".webp", "image/webp"],
   [".gif", "image/gif"],
 ]);
+
+// Slash command catalog. Mirrors the TUI's REGISTERED_COMMANDS
+// (crates/jcode-tui/.../state_ui_input_helpers.rs, jcode v0.76.0) with an
+// extra `tier` field describing how the sidebar handles each command:
+//   native   -> implemented directly against the SDK (T1)
+//   prompt   -> same mechanism as the TUI: a prompt template sent as a
+//               synthetic user turn (T2)
+//   cli      -> runs `jcode <subcommand>` and shows the output (T3)
+//   local    -> implemented with extension-local state/UI (T4)
+//   terminal -> opens the terminal agent with the command prefilled (T5)
 const SLASH_COMMANDS = [
-  { name: "/help", description: "Show commands available in the VS Code chat" },
-  { name: "/model", description: "List or switch models", usage: "/model [name]" },
-  { name: "/models", description: "Alias for /model", usage: "/models [name]" },
-  { name: "/effort", description: "Show or set reasoning effort", usage: "/effort [level]" },
-  { name: "/clear", description: "Clear conversation history" },
-  { name: "/compact", description: "Compact the current session context" },
-  { name: "/rename", description: "Rename the current session", usage: "/rename <title>" },
-  { name: "/info", description: "Show session, provider, model, and runtime info" },
-  { name: "/cancel", description: "Cancel the current response" },
+  { name: "/help", usage: "/help", description: "Show commands available in the sidebar", tier: "local" },
+  { name: "/?", usage: "/?", description: "Alias for /help", tier: "local", hidden: true },
+  { name: "/commands", usage: "/commands", description: "Alias for /help", tier: "local", hidden: true },
+  { name: "/model", usage: "/model [name]", description: "List or switch models", tier: "native" },
+  { name: "/models", usage: "/models [name]", description: "Alias for /model", tier: "native", hidden: true },
+  { name: "/effort", usage: "/effort [level]", description: "Show or set reasoning effort", tier: "native" },
+  { name: "/cancel", usage: "/cancel", description: "Cancel the current prompt or operation", tier: "native" },
+  { name: "/clear", usage: "/clear", description: "Clear conversation history", tier: "native" },
+  { name: "/cls", usage: "/cls", description: "Clear the view only, keeping context", tier: "local" },
+  { name: "/rewind", usage: "/rewind [index]", description: "Rewind conversation to a previous message", tier: "native" },
+  { name: "/compact", usage: "/compact", description: "Compact context", tier: "native" },
+  { name: "/rename", usage: "/rename <title>", description: "Rename the current session", tier: "native" },
+  { name: "/info", usage: "/info", description: "Show session, provider, model, and runtime info", tier: "native" },
+  { name: "/context", usage: "/context", description: "Show the session context snapshot", tier: "native" },
+  { name: "/resume", usage: "/resume", description: "Open the session picker", tier: "native" },
+  { name: "/sessions", usage: "/sessions", description: "Alias for /resume", tier: "native", hidden: true },
+  { name: "/session", usage: "/session", description: "Alias for /resume", tier: "native", hidden: true },
+  { name: "/save", usage: "/save [label]", description: "Bookmark this session for easy access", tier: "local" },
+  { name: "/unsave", usage: "/unsave", description: "Remove the bookmark from this session", tier: "local" },
+  { name: "/commit", usage: "/commit", description: "Make logical commits from current changes", tier: "prompt" },
+  { name: "/commit-push", usage: "/commit-push", description: "Make logical commits, then push", tier: "prompt" },
+  { name: "/plan", usage: "/plan", description: "Create a plan-only response as a plan card", tier: "prompt" },
+  { name: "/improve", usage: "/improve", description: "Autonomously improve the repository", tier: "prompt" },
+  { name: "/refactor", usage: "/refactor", description: "Run a safe refactor loop", tier: "prompt" },
+  { name: "/fix", usage: "/fix", description: "Recover when the model cannot continue", tier: "prompt" },
+  { name: "/test", usage: "/test", description: "Verify current changes with layered tests", tier: "prompt" },
+  { name: "/todos", usage: "/todos", description: "Show the session todo list", tier: "prompt" },
+  { name: "/poke", usage: "/poke", description: "Poke the model to resume with incomplete todos", tier: "prompt" },
+  { name: "/review", usage: "/review", description: "Launch a one-shot headed review session", tier: "prompt" },
+  { name: "/judge", usage: "/judge", description: "Launch a one-shot headed judge session", tier: "prompt" },
+  { name: "/autoreview", usage: "/autoreview [on|off]", description: "Show/toggle automatic end-of-turn review", tier: "prompt" },
+  { name: "/autojudge", usage: "/autojudge [on|off]", description: "Show/toggle automatic end-of-turn judging", tier: "prompt" },
+  { name: "/initiatives", usage: "/initiatives", description: "Open initiatives overview / resume tracked initiatives", tier: "prompt" },
+  { name: "/goals", usage: "/goals", description: "Legacy alias for /initiatives", tier: "prompt", hidden: true },
+  { name: "/btw", usage: "/btw <question>", description: "Ask a side question", tier: "prompt" },
+  { name: "/observe", usage: "/observe", description: "Show the latest tool context", tier: "prompt" },
+  { name: "/overnight", usage: "/overnight", description: "Run a supervised overnight coordinator", tier: "prompt" },
+  { name: "/swarm", usage: "/swarm", description: "Toggle swarm feature", tier: "prompt" },
+  { name: "/usage", usage: "/usage", description: "Show connected provider usage limits", tier: "cli", cli: ["usage"] },
+  { name: "/version", usage: "/version", description: "Show current version", tier: "cli", cli: ["version"] },
+  { name: "/memory", usage: "/memory [list|search <q>]", description: "Show or search stored memories", tier: "cli", cli: ["memory", "list"] },
+  { name: "/telemetry", usage: "/telemetry [status|enable|disable]", description: "Show or change what jcode sends", tier: "cli", cli: ["telemetry", "status"] },
+  { name: "/provider-test-coverage", usage: "/provider-test-coverage", description: "Show live-test evidence for the current provider/model", tier: "cli", cli: ["provider-test-coverage"] },
+  { name: "/model-status", usage: "/model-status", description: "Alias for /provider-test-coverage", tier: "cli", cli: ["provider-test-coverage"], hidden: true },
+  { name: "/refresh-model-list", usage: "/refresh-model-list", description: "Refresh provider model catalogs", tier: "cli", cli: ["model", "list"] },
+  { name: "/auth", usage: "/auth", description: "Show authentication status", tier: "cli", cli: ["auth"] },
+  { name: "/login", usage: "/login", description: "Login to a provider (opens in terminal)", tier: "terminal", command: "/login" },
+  { name: "/logout", usage: "/logout", description: "Log out of a provider (opens in terminal)", tier: "terminal", command: "/logout" },
+  { name: "/account", usage: "/account", description: "Open the combined account picker (terminal)", tier: "terminal", command: "/account" },
+  { name: "/accounts", usage: "/accounts", description: "Alias for /account", tier: "terminal", command: "/account", hidden: true },
+  { name: "/update", usage: "/update", description: "Update jcode (opens in terminal)", tier: "terminal", command: "/update" },
+  { name: "/permissions", usage: "/permissions", description: "Review pending permission requests (terminal)", tier: "terminal", command: "/permissions" },
+  { name: "/transcript", usage: "/transcript", description: "Open the session transcript (terminal)", tier: "terminal", command: "/transcript" },
+  { name: "/config", usage: "/config", description: "Open VS Code settings for jcode", tier: "local" },
+  { name: "/keys", usage: "/keys", description: "Show keybinding conflicts (terminal)", tier: "terminal", command: "/keys" },
+  { name: "/hotkeys", usage: "/hotkeys", description: "List hotkeys (terminal)", tier: "terminal", command: "/hotkeys" },
+  { name: "/colors", usage: "/colors", description: "List and configure TUI colors (terminal)", tier: "terminal", command: "/colors" },
+  { name: "/changelog", usage: "/changelog", description: "Show recent changes (terminal)", tier: "terminal", command: "/changelog" },
+  { name: "/diff", usage: "/diff [mode]", description: "Set diff display mode (terminal)", tier: "terminal", command: "/diff" },
+  { name: "/thinking-display", usage: "/thinking-display [off|full|current]", description: "Show/hide thinking text (terminal)", tier: "terminal", command: "/thinking-display" },
+  { name: "/tool-call-details", usage: "/tool-call-details", description: "Toggle tool call details (terminal)", tier: "terminal", command: "/tool-call-details" },
+  { name: "/show-agentgrep-output", usage: "/show-agentgrep-output", description: "Toggle agentgrep output (terminal)", tier: "terminal", command: "/show-agentgrep-output" },
+  { name: "/compact-notifications", usage: "/compact-notifications [on|off]", description: "Toggle notification style (terminal)", tier: "terminal", command: "/compact-notifications" },
+  { name: "/alignment", usage: "/alignment [left|center]", description: "Set text alignment (terminal)", tier: "terminal", command: "/alignment" },
+  { name: "/fast", usage: "/fast", description: "Toggle fast mode (terminal)", tier: "terminal", command: "/fast" },
+  { name: "/transport", usage: "/transport", description: "Show/change connection transport (terminal)", tier: "terminal", command: "/transport" },
+  { name: "/terminal-setup", usage: "/terminal-setup", description: "Fix Shift+Enter newlines (terminal)", tier: "terminal", command: "/terminal-setup" },
+  { name: "/screenshot", usage: "/screenshot", description: "Capture a screenshot debug state (terminal)", tier: "terminal", command: "/screenshot" },
+  { name: "/record", usage: "/record", description: "Record a demo capture (terminal)", tier: "terminal", command: "/record" },
+  { name: "/reload", usage: "/reload", description: "Reload into the newest binary (terminal)", tier: "terminal", command: "/reload" },
+  { name: "/restart", usage: "/restart", description: "Restart with the current binary (terminal)", tier: "terminal", command: "/restart" },
+  { name: "/rebuild", usage: "/rebuild", description: "Background rebuild and reload (terminal)", tier: "terminal", command: "/rebuild" },
+  { name: "/selfdev", usage: "/selfdev", description: "Open a new self-dev jcode session (terminal)", tier: "terminal", command: "/selfdev" },
+  { name: "/remote", usage: "/remote", description: "Reach this session from another machine (terminal)", tier: "terminal", command: "/remote" },
+  { name: "/continue", usage: "/continue", description: "Continue interrupted live sessions (terminal)", tier: "terminal", command: "/continue" },
+  { name: "/resumeall", usage: "/resumeall", description: "Alias for /continue (terminal)", tier: "terminal", command: "/continue", hidden: true },
+  { name: "/ssh", usage: "/ssh", description: "Connect to a remote machine via SSH (terminal)", tier: "terminal", command: "/ssh" },
+  { name: "/git", usage: "/git", description: "Show git status for the working directory (terminal)", tier: "terminal", command: "/git" },
+  { name: "/skills", usage: "/skills", description: "Show loaded skills (terminal)", tier: "terminal", command: "/skills" },
+  { name: "/agents", usage: "/agents", description: "Configure models for agent roles (terminal)", tier: "terminal", command: "/agents" },
+  { name: "/subagent", usage: "/subagent", description: "Launch a subagent manually (terminal)", tier: "terminal", command: "/subagent" },
+  { name: "/fork", usage: "/fork [prompt]", description: "Fork the session into a new window (terminal)", tier: "terminal", command: "/fork" },
+  { name: "/transfer", usage: "/transfer", description: "Hand off context into a fresh session (terminal)", tier: "terminal", command: "/transfer" },
+  { name: "/workspace", usage: "/workspace", description: "Niri-style session workspace (terminal)", tier: "terminal", command: "/workspace" },
+  { name: "/catchup", usage: "/catchup", description: "Open the Catch Up picker (terminal)", tier: "terminal", command: "/catchup" },
+  { name: "/active", usage: "/active", description: "Manage live sessions (terminal)", tier: "terminal", command: "/active" },
+  { name: "/quit", usage: "/quit", description: "Exit jcode (not available in the sidebar)", tier: "terminal", command: "/quit", hidden: true },
 ];
+
+// Prompt templates for tier "prompt" commands, mirroring the TUI's
+// build_*_prompt() synthetic user turns.
+const PROMPT_COMMANDS = {
+  "/commit": "Create logical commits from the current changes. Inspect `git status` and the diffs, then commit the work in logical units with clear, conventional messages. Do not push.",
+  "/commit-push": "Create logical commits from the current changes, then push them to the remote. Inspect `git status` and the diffs first, and commit in logical units with clear, conventional messages.",
+  "/plan": "Create a plan-only response. Analyze the current request and repository, then produce a step-by-step plan as a structured plan card. Do not make any changes yet.",
+  "/improve": "Autonomously improve this repository. Identify the highest-impact improvements, implement them safely, and validate the result with tests or checks. Keep changes focused and explain each one.",
+  "/refactor": "Run a safe refactor loop on the current code: identify refactoring opportunities, apply them incrementally, and validate after each step that nothing broke.",
+  "/fix": "Recover from the current state: diagnose why progress stalled or broke, then fix it with one small verifiable task at a time. Do not continue blindly.",
+  "/test": "Verify the current claims and changes with layered tests. Identify the right test levels, run the relevant checks, and fix what fails. Report the evidence.",
+  "/todos": "Show the current session todo list as a structured list, with status for each item.",
+  "/poke": "Resume the current work. Review the incomplete todos and continue making progress on them, one small verifiable task at a time.",
+  "/review": "Run a thorough review of the current changes. Inspect the diffs for correctness, risks, and regressions, and report findings with concrete suggestions.",
+  "/judge": "Judge the quality of the last response: correctness, completeness, and clarity. Score it and list the most important improvements.",
+  "/autoreview": "Review the work completed in this turn. Inspect the changes for correctness, risks, and regressions, and report findings.",
+  "/autojudge": "Judge the quality of the work completed in this turn. Score it and list the most important improvements.",
+  "/initiatives": "Show the current initiatives overview. List tracked initiatives, their milestones, and current progress.",
+  "/goals": "Show the current initiatives overview. List tracked initiatives, their milestones, and current progress.",
+  "/btw": "Answer this side question concisely without changing anything in the repository:",
+  "/observe": "Show the latest tool context and what the agent is currently working on.",
+  "/overnight": "Run a supervised overnight coordinator: break the current goals into small verifiable tasks and work through them methodically, reporting progress and stopping when blocked.",
+  "/swarm": "Toggle swarm mode for this session and explain what changed.",
+};
 
 let jcodeTerminal;
 let lastTextEditor;
+let outputChannel;
+
+function log(...parts) {
+  if (!outputChannel) {
+    outputChannel = vscode.window.createOutputChannel("Jcode");
+  }
+  outputChannel.appendLine(
+    `[${new Date().toLocaleTimeString()}] ${parts.map((part) => (part instanceof Error ? part.stack || part.message : String(part))).join(" ")}`,
+  );
+}
 
 // The chat backend talks to the user's jcode through the official TypeScript
 // SDK (@1jehuang/jcode-sdk), which dials the `jcode api-bridge` Unix socket.
 // The bridge is started automatically (detached) the first time it is needed,
-// unless one is already running. Model picker entries come from the daemon's
-// live catalog (listModels), and the model and reasoning-effort selectors
-// drive setModel / setReasoningEffort on the session.
+// unless one is already running.
 let sdkPromise;
 let clientPromise;
 let currentClient;
@@ -74,12 +210,21 @@ let extensionApiSocket;
 
 function getSdk() {
   if (!sdkPromise) {
-    sdkPromise = import("@1jehuang/jcode-sdk").catch((error) => {
+    sdkPromise = Promise.race([
+      import("@1jehuang/jcode-sdk"),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error("timed out after 10s while loading the Jcode SDK module")),
+          10000,
+        ),
+      ),
+    ]).catch((error) => {
       sdkPromise = undefined;
-      throw new Error(
-        `The Jcode TypeScript SDK could not be loaded (${error.message}). ` +
-          'Install extension dependencies with "npm install" in the extension folder, then reload the window.',
-      );
+      const message =
+        `The Jcode TypeScript SDK could not be loaded (${errorMessage(error)}). ` +
+        "Install extension dependencies with \"npm install\" in the extension folder, then reload the window.";
+      log(message);
+      throw new Error(message);
     });
   }
   return sdkPromise;
@@ -87,6 +232,14 @@ function getSdk() {
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function withTimeout(promise, milliseconds, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${milliseconds}ms: ${label}`)), milliseconds);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 function errorMessage(error) {
@@ -120,15 +273,23 @@ async function getJcodeClient() {
 
 async function connectWithBridge() {
   const { JcodeClient } = await getSdk();
-  const apiSocket = process.env.JCODE_API_SOCKET || extensionApiSocket;
+  const apiSocket = getApiSocketPath();
+  log(`connecting to harness API at ${apiSocket || "<default socket>"}`);
   try {
-    const client = await JcodeClient.connect({ clientName: CLIENT_NAME, socketPath: apiSocket });
+    const client = await withTimeout(
+      JcodeClient.connect({ clientName: CLIENT_NAME, socketPath: apiSocket }),
+      5000,
+      "dialing the harness API socket",
+    );
     watchClientLiveness(client);
+    log("connected to existing harness API");
     return client;
   } catch (firstError) {
     if (firstError?.code !== "connect_failed") {
+      log(`harness API connection rejected: ${errorMessage(firstError)}`);
       throw firstError;
     }
+    log(`no harness API at ${apiSocket || "<default socket>"}: starting api-bridge`);
     removeOwnedStaleSocket(apiSocket);
     spawnBridge(apiSocket);
     const deadline = Date.now() + BRIDGE_CONNECT_TIMEOUT_MS;
@@ -139,18 +300,36 @@ async function connectWithBridge() {
         spawnBridge(apiSocket);
       }
       try {
-        const client = await JcodeClient.connect({ clientName: CLIENT_NAME, socketPath: apiSocket });
+        const client = await withTimeout(
+          JcodeClient.connect({ clientName: CLIENT_NAME, socketPath: apiSocket }),
+          5000,
+          "dialing the harness API socket",
+        );
         watchClientLiveness(client);
+        log("connected to spawned harness API");
         return client;
       } catch (error) {
         lastError = error;
       }
     }
-    throw new Error(
+    const message =
       `Could not reach the Jcode harness API (${errorMessage(lastError)}). ` +
-        "Make sure the Jcode CLI is installed and new enough to support `jcode api-bridge`.",
-    );
+      "Make sure the Jcode CLI is installed and new enough to support `jcode api-bridge`. " +
+      "Check the Jcode output channel for bridge diagnostics, or set `jcode.executablePath` to the absolute path of the jcode binary.";
+    log(message);
+    throw new Error(message);
   }
+}
+
+function getApiSocketPath() {
+  if (process.env.JCODE_API_SOCKET) {
+    return process.env.JCODE_API_SOCKET;
+  }
+  const configured = vscode.workspace.getConfiguration("jcode").get("apiSocketPath", "");
+  if (typeof configured === "string" && configured) {
+    return configured;
+  }
+  return extensionApiSocket;
 }
 
 function removeOwnedStaleSocket(apiSocket) {
@@ -183,48 +362,70 @@ function spawnBridge(apiSocket) {
   if (apiSocket) {
     args.push("--api-socket", apiSocket);
   }
+  log(`starting bridge: ${executable} ${args.join(" ")}`);
   try {
     const child = spawn(executable, args, {
       detached: true,
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", "pipe"],
       env: { ...process.env },
     });
-    child.on("error", () => {
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      log(`bridge stderr: ${chunk.trim()}`);
+    });
+    child.on("error", (error) => {
+      log(`bridge spawn error: ${errorMessage(error)}`);
       if (bridgeProcess === child) bridgeProcess = undefined;
     });
-    child.on("exit", () => {
+    child.on("exit", (code, signal) => {
+      log(`bridge exited: code=${code} signal=${signal}`);
       if (bridgeProcess === child) bridgeProcess = undefined;
     });
     child.unref();
     bridgeProcess = child;
   } catch (error) {
-    // A missing executable surfaces asynchronously through the poll loop
-    // in connectWithBridge, which reports the actionable error.
+    log(`bridge spawn threw: ${errorMessage(error)}`);
   }
 }
 
 function resolveJcodeExecutable(configured) {
   if (configured !== "jcode") return configured;
-  const local = path.join(os.homedir(), ".local", "bin", "jcode");
-  return fs.existsSync(local) ? local : configured;
+  const candidates = [
+    path.join(os.homedir(), ".local", "bin", "jcode"),
+    path.join(os.homedir(), ".jcode", "builds", "current", "jcode"),
+    "/opt/homebrew/bin/jcode",
+    "/usr/local/bin/jcode",
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch {
+      // Unreadable path; try the next candidate.
+    }
+  }
+  return configured;
 }
 
 /**
  * @param {vscode.ExtensionContext} context
  */
 function activate(context) {
+  log("extension activated");
   if (context.globalStorageUri.scheme === "file") {
     fs.mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
     extensionApiSocket = path.join(context.globalStorageUri.fsPath, "api.sock");
   }
   lastTextEditor = vscode.window.activeTextEditor;
-  const chatProvider = new JcodeChatViewProvider(context);
+  const chatProvider = new JcodeChatProvider(context);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(CHAT_VIEW_ID, chatProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
     vscode.commands.registerCommand("jcode.open", () => chatProvider.focus()),
+    vscode.commands.registerCommand("jcode.diagnose", () => runDiagnostics(context)),
     vscode.commands.registerCommand("jcode.openTerminal", () => openJcodeTerminal(context)),
     vscode.commands.registerCommand("jcode.askSelection", () =>
       chatProvider.stageCurrentSelection(),
@@ -308,7 +509,32 @@ function activate(context) {
   }
 }
 
-class JcodeChatViewProvider {
+async function runDiagnostics(context) {
+  const config = vscode.workspace.getConfiguration("jcode");
+  const executable = resolveJcodeExecutable(config.get("executablePath", "jcode"));
+  const socket = getApiSocketPath();
+  log("=== jcode diagnostics ===");
+  log(`version: ${CLIENT_NAME}`);
+  log(`executable: ${executable}`);
+  log(`api socket: ${socket || "<SDK default>"}`);
+  log(`launchArguments: ${JSON.stringify(config.get("launchArguments", []))}`);
+  try {
+    const client = await getJcodeClient();
+    const info = await withTimeout(client.getRuntimeInfo(undefined), 5000, "runtime info");
+    log(`connected: ${info.server} protocol=${info.protocolVersion} healthy=${info.healthy}`);
+    log(`providers: ${(info.providers || []).join(", ")}`);
+    const sessions = await client.listSessions();
+    log(`sessions: ${sessions.length}`);
+    void vscode.window.showInformationMessage(
+      `Jcode connected (${info.server}). See the Jcode output channel for details.`,
+    );
+  } catch (error) {
+    log(`diagnostics failed: ${errorMessage(error)}`);
+    void vscode.window.showErrorMessage(`Jcode diagnostics failed: ${errorMessage(error)}`);
+  }
+}
+
+class JcodeChatProvider {
   /** @param {vscode.ExtensionContext} context */
   constructor(context) {
     this.context = context;
@@ -327,20 +553,27 @@ class JcodeChatViewProvider {
     this.postChain = Promise.resolve();
     this.attachments = new Map();
     this.nextAttachmentId = 1;
+    this.testPostedMessages = undefined;
   }
 
   resolveWebviewView(webviewView) {
+    log("resolveWebviewView called");
     this.view = webviewView;
-    webviewView.webview.options = { enableScripts: true };
-    webviewView.webview.html = getChatHtml(webviewView.webview);
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "media")],
+    };
+    webviewView.webview.html = getChatHtml(webviewView.webview, this.context);
 
     const messageSubscription = webviewView.webview.onDidReceiveMessage(async (message) => {
       switch (message?.type) {
         case "ready":
+          log(`webview ready received (hasHistory=${Boolean(message.hasHistory)}, sessionId=${this.sessionId || "none"})`);
           if (!message.hasHistory && !this.sessionId) {
             await this.context.workspaceState.update(CHAT_SESSION_KEY, undefined);
           }
           this.postBootstrap();
+          log("bootstrap posted");
           void this.restoreChat();
           break;
         case "send":
@@ -373,6 +606,15 @@ class JcodeChatViewProvider {
           break;
         case "effort":
           await this.setSelectedEffort(message.effort);
+          break;
+        case "attachSession":
+          await this.attachToSession(message.sessionId);
+          break;
+        case "renameSession":
+          await this.renameCurrentSession(message.sessionId, message.title);
+          break;
+        case "webviewError":
+          log(`webview error: ${message.message}`);
           break;
       }
     });
@@ -411,6 +653,16 @@ class JcodeChatViewProvider {
     return vscode.workspace.getConfiguration("jcode").get("defaultEffort", "");
   }
 
+  post(message) {
+    this.postChain = this.postChain.then(async () => {
+      try {
+        await this.view?.webview.postMessage(message);
+      } catch (error) {
+        log(`webview post failed: ${errorMessage(error)}`);
+      }
+    });
+  }
+
   postBootstrap() {
     this.post({
       type: "bootstrap",
@@ -419,7 +671,7 @@ class JcodeChatViewProvider {
       model: this.getSelectedModel(),
       effortLevels: EFFORT_LEVELS,
       effort: this.getSelectedEffort(),
-      slashCommands: SLASH_COMMANDS,
+      slashCommands: SLASH_COMMANDS.filter((command) => !command.hidden),
       attachments: [...this.attachments.values()].map(publicAttachment),
     });
   }
@@ -556,13 +808,19 @@ class JcodeChatViewProvider {
   }
 
   async restoreChat() {
+    log("restoreChat started");
     const selection = this.pendingSelection?.label;
     let sessionId;
     let models = [];
     let current;
     let error;
     try {
-      const client = await this.ensureSession();
+      const client = await withTimeout(
+        this.ensureSession(),
+        45000,
+        "restoring the Jcode session (bridge startup + handshake)",
+      );
+      log("ensureSession resolved");
       sessionId = this.sessionId;
       try {
         ({ models, current } = await client.listModels(sessionId));
@@ -581,7 +839,7 @@ class JcodeChatViewProvider {
       model: current || this.getSelectedModel() || "",
       effortLevels: EFFORT_LEVELS,
       effort: this.getSelectedEffort(),
-      slashCommands: SLASH_COMMANDS,
+      slashCommands: SLASH_COMMANDS.filter((command) => !command.hidden),
       attachments: [...this.attachments.values()].map(publicAttachment),
       error,
     });
@@ -751,12 +1009,15 @@ class JcodeChatViewProvider {
       attachments = await this.consumeAttachments(options.attachmentIds);
       if (!this.isTurnActive(turnId)) throw cancelledError();
 
-      if (!this.isTurnActive(turnId)) throw cancelledError();
       this.post({ type: "user", text: instruction, selection: selection?.label, attachments: attachments.public, turnId });
       this.post({ type: "sendAccepted", turnId });
       submitted = true;
 
       const contextParts = [instruction];
+      const editorContext = this.editorContextSummary();
+      if (editorContext) {
+        contextParts.push(editorContext);
+      }
       if (selection) {
         contextParts.push(
           `The user explicitly shared the current VS Code selection from ${JSON.stringify(selection.source)}.`,
@@ -789,6 +1050,7 @@ class JcodeChatViewProvider {
         else this.post({ type: "sendRejected", text: instruction, turnId });
       } else {
         const message = errorMessage(error);
+        log(`chat send failed: ${message}`);
         this.post({ type: "error", text: message, turnId });
         this.post({ type: "sendRejected", text: instruction, turnId });
         void vscode.window.showErrorMessage(`Jcode chat failed: ${message}`);
@@ -832,14 +1094,18 @@ class JcodeChatViewProvider {
     const [rawName, ...rest] = input.split(/\s+/);
     const name = rawName === "/models" ? "/model" : rawName;
     const argument = rest.join(" ").trim();
-    if (!SLASH_COMMANDS.some((command) => command.name === rawName)) return false;
+    const command = SLASH_COMMANDS.find((candidate) => candidate.name === rawName);
+    if (!command || command.hidden) {
+      return false;
+    }
+
     if (name === "/cancel") {
       await this.cancel();
       this.post({ type: "notice", text: "Cancel requested." });
       return true;
     }
-    if (name === "/help") {
-      this.post({ type: "commandHelp", commands: SLASH_COMMANDS });
+    if (name === "/help" || name === "/?" || name === "/commands") {
+      this.post({ type: "commandHelp", commands: SLASH_COMMANDS.filter((candidate) => !candidate.hidden) });
       return true;
     }
     if (name === "/model") {
@@ -856,7 +1122,9 @@ class JcodeChatViewProvider {
         } catch (error) {
           this.post({ type: "error", text: `/model failed: ${errorMessage(error)}` });
         }
-      } else await this.setSelectedModel(argument);
+      } else {
+        await this.setSelectedModel(argument);
+      }
       return true;
     }
     if (name === "/effort") {
@@ -865,6 +1133,42 @@ class JcodeChatViewProvider {
       else this.post({ type: "error", text: `Unknown effort ${JSON.stringify(argument)}. Use: ${EFFORT_LEVELS.join(", ")}.` });
       return true;
     }
+    if (name === "/cls") {
+      this.post({ type: "cleared" });
+      return true;
+    }
+    if (name === "/save" || name === "/unsave") {
+      return this.toggleBookmark(name === "/save" ? argument : undefined);
+    }
+    if (name === "/config") {
+      void vscode.commands.executeCommand("workbench.action.openSettings", "jcode");
+      return true;
+    }
+    if (name === "/resume" || name === "/sessions" || name === "/session") {
+      await this.openSessions();
+      return true;
+    }
+
+    if (command.tier === "native") {
+      return this.executeNativeSlash(name, argument);
+    }
+    if (command.tier === "prompt") {
+      return this.executePromptSlash(name, argument);
+    }
+    if (command.tier === "cli") {
+      return this.executeCliSlash(command);
+    }
+    if (command.tier === "terminal") {
+      const terminal = openJcodeTerminal(this.context);
+      const prefilled = (command.command || command.name) + (argument ? ` ${argument}` : "");
+      terminal.sendText(prefilled, true);
+      this.post({ type: "notice", text: `Opened the terminal agent with ${command.name}.` });
+      return true;
+    }
+    return false;
+  }
+
+  async executeNativeSlash(name, argument) {
     try {
       const client = await this.ensureSession();
       if (name === "/clear") {
@@ -881,6 +1185,14 @@ class JcodeChatViewProvider {
           await client.renameSession(this.sessionId, argument);
           this.post({ type: "notice", text: `Session renamed to ${argument}.` });
         }
+      } else if (name === "/rewind") {
+        const index = Number.parseInt(argument, 10);
+        if (!Number.isFinite(index) || index < 0) {
+          this.post({ type: "error", text: "Usage: /rewind <message index>" });
+        } else {
+          await client.rewind(this.sessionId, index);
+          this.post({ type: "notice", text: `Rewound to message ${index}. Use /rewind-undo to restore.` });
+        }
       } else if (name === "/info") {
         const runtime = await client.getRuntimeInfo(this.sessionId);
         this.post({
@@ -891,13 +1203,189 @@ class JcodeChatViewProvider {
             ["Provider", runtime.provider || "auto"],
             ["Model", runtime.model || this.getSelectedModel() || "auto"],
             ["Server", runtime.server || "Jcode"],
+            ["Protocol", String(runtime.protocolVersion || "")],
           ],
         });
+      } else if (name === "/context") {
+        const history = await client.getHistory(this.sessionId);
+        const rows = history.slice(-10).map((message) => [
+          message.role || "?",
+          String(message.content || message.text || "").slice(0, 80),
+        ]);
+        this.post({ type: "commandInfo", title: `Context (${history.length} messages)`, rows });
       }
+      return true;
     } catch (error) {
       this.post({ type: "error", text: `${name} failed: ${errorMessage(error)}` });
+      return true;
+    }
+  }
+
+  async executePromptSlash(name, argument) {
+    let promptText = PROMPT_COMMANDS[name];
+    if (!promptText) return false;
+    if (name === "/btw") {
+      promptText = `${promptText} ${argument || ""}`.trim();
+      if (!argument) {
+        this.post({ type: "error", text: "Usage: /btw <question>" });
+        return true;
+      }
+    } else if (argument) {
+      promptText = `${promptText}\n\nRequest: ${argument}`;
+    }
+    return this.runSyntheticTurn(name, promptText);
+  }
+
+  async runSyntheticTurn(commandName, promptText) {
+    const turnId = this.nextTurnId++;
+    this.activeTurnId = turnId;
+    this.running = true;
+    this.cancelRequested = false;
+    this.post({ type: "running", running: true, turnId });
+    try {
+      const selection = this.pendingSelection || await captureSelectionContext(this.context, false);
+      this.pendingSelection = undefined;
+      this.post({ type: "user", text: `${commandName} ${promptText.slice(0, 40)}…`, selection: selection?.label, attachments: [], turnId });
+      this.post({ type: "sendAccepted", turnId });
+      const result = await this.runTurn(promptText, [], turnId, undefined);
+      if (!this.isTurnActive(turnId)) return undefined;
+      this.post({
+        type: "assistant",
+        text: result.text || "Jcode completed without returning text.",
+        provider: result.provider,
+        model: result.model,
+        turnId,
+      });
+      return true;
+    } catch (error) {
+      this.post({ type: "error", text: `${commandName} failed: ${errorMessage(error)}`, turnId });
+      return true;
+    } finally {
+      if (this.activeTurnId === turnId) {
+        this.running = false;
+        this.cancelRequested = false;
+        this.activeTurnId = undefined;
+        this.post({ type: "running", running: false, turnId });
+      }
+    }
+  }
+
+  async executeCliSlash(command) {
+    const executable = resolveJcodeExecutable(vscode.workspace.getConfiguration("jcode").get("executablePath", "jcode"));
+    const args = [...command.cli];
+    this.post({ type: "notice", text: `Running jcode ${args.join(" ")}…` });
+    try {
+      const output = await runJcodeCli(executable, args);
+      const lines = output.trim().split("\n").filter(Boolean);
+      this.post({
+        type: "commandInfo",
+        title: `jcode ${args.join(" ")}`,
+        rows: lines.map((line) => ["", line]),
+      });
+    } catch (error) {
+      this.post({ type: "error", text: `${command.name} failed: ${errorMessage(error)}` });
     }
     return true;
+  }
+
+  async openSessions() {
+    try {
+      const client = await getJcodeClient();
+      const sessions = await client.listSessions();
+      this.post({ type: "sessions", sessions, currentSessionId: this.sessionId });
+    } catch (error) {
+      this.post({ type: "error", text: `Could not list sessions: ${errorMessage(error)}` });
+    }
+  }
+
+  async attachToSession(sessionId) {
+    try {
+      const client = await getJcodeClient();
+      await client.attachSession(sessionId);
+      this.sessionId = sessionId;
+      this.sessionClient = client;
+      this.sessionInitPromise = undefined;
+      await this.context.workspaceState.update(CHAT_SESSION_KEY, sessionId);
+      this.post({ type: "notice", text: `Attached to ${sessionId}.` });
+      void this.restoreChat();
+    } catch (error) {
+      this.post({ type: "error", text: `Could not attach to session: ${errorMessage(error)}` });
+    }
+  }
+
+  async renameCurrentSession(sessionId, title) {
+    try {
+      const client = await getJcodeClient();
+      await client.renameSession(sessionId, title);
+      this.post({ type: "notice", text: title ? `Session renamed to ${title}.` : "Session title cleared." });
+    } catch (error) {
+      this.post({ type: "error", text: `Could not rename session: ${errorMessage(error)}` });
+    }
+  }
+
+  async toggleBookmark(label) {
+    const bookmarks = new Map(this.context.workspaceState.get(CHAT_BOOKMARKS_KEY) || []);
+    if (!this.sessionId) {
+      try {
+        await this.ensureSession();
+      } catch (error) {
+        this.post({ type: "error", text: `Could not bookmark the session: ${errorMessage(error)}` });
+        return true;
+      }
+    }
+    if (label) {
+      bookmarks.set(this.sessionId, label);
+      this.post({ type: "notice", text: `Session saved as "${label}".` });
+    } else if (bookmarks.has(this.sessionId)) {
+      bookmarks.delete(this.sessionId);
+      this.post({ type: "notice", text: "Bookmark removed." });
+    } else {
+      bookmarks.set(this.sessionId, this.sessionId);
+      this.post({ type: "notice", text: "Session saved." });
+    }
+    await this.context.workspaceState.update(CHAT_BOOKMARKS_KEY, [...bookmarks.entries()]);
+    return true;
+  }
+
+  /**
+   * Compact summary of the VS Code editor state, injected into each message
+   * when `jcode.shareEditorContext` is enabled. The agent's session working
+   * directory is the workspace root, so it can read these files itself.
+   */
+  editorContextSummary() {
+    if (!vscode.workspace.getConfiguration("jcode").get("shareEditorContext", true)) {
+      return undefined;
+    }
+    const parts = [];
+    const editor = getCurrentTextEditor();
+    if (editor?.document.uri.scheme === "file") {
+      const file = editor.document.uri.fsPath;
+      const selections = editor.selections.filter((selection) => !selection.isEmpty);
+      const where = selections.length > 0
+        ? ` (selection: ${selections.map(formatRange).join(", ")})`
+        : "";
+      parts.push(`active file: ${file}${where}${editor.document.isDirty ? " [dirty]" : ""}`);
+    }
+    const openFiles = vscode.workspace.textDocuments
+      .filter((document) => document.uri.scheme === "file")
+      .slice(0, 20)
+      .map((document) => document.uri.fsPath);
+    if (openFiles.length > 0) {
+      const dirty = openFiles.filter((file) =>
+        vscode.workspace.textDocuments.some(
+          (document) => document.uri.scheme === "file" && document.uri.fsPath === file && document.isDirty,
+        ),
+      );
+      parts.push(`open files (${openFiles.length}): ${openFiles.join(", ")}${dirty.length ? `; dirty: ${dirty.join(", ")}` : ""}`);
+    }
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (workspaceRoot) {
+      parts.push(`workspace root: ${workspaceRoot}`);
+    }
+    if (parts.length === 0) {
+      return undefined;
+    }
+    return `VS Code context: ${parts.join(" | ")}`;
   }
 
   async runTurn(prompt, images = [], turnId, attachmentState) {
@@ -919,15 +1407,44 @@ class JcodeChatViewProvider {
       throw cancelledError();
     }
     if (attachmentState) attachmentState.accepted = true;
+    const autoApprove = Boolean(vscode.workspace.getConfiguration("jcode").get("autoApprove", false));
     const result = await client.run(sessionId, prompt, {
       images,
-      autoApprove: true,
+      autoApprove,
       onEvent: (event) => {
         if (!this.isTurnActive(turnId)) return;
-        if (event.ev === "text_delta") {
-          this.post({ type: "delta", text: event.text, turnId, sessionId });
-        } else if (event.ev === "model_info" && event.model) {
-          this.post({ type: "options", model: event.model });
+        switch (event.ev) {
+          case "text_delta":
+            this.post({ type: "delta", text: event.text, turnId, sessionId });
+            break;
+          case "reasoning_delta":
+            this.post({ type: "reasoning", text: event.text, turnId, sessionId });
+            break;
+          case "tool_start":
+            this.post({ type: "tool", kind: "start", name: event.name, detail: event.input ? JSON.stringify(event.input) : "", turnId });
+            break;
+          case "tool_done":
+            this.post({ type: "tool", kind: "done", name: event.name, detail: event.output ? String(event.output).slice(0, 500) : "", error: Boolean(event.error), turnId });
+            break;
+          case "token_usage":
+            this.post({ type: "usage", usage: event, turnId });
+            break;
+          case "model_info":
+            if (event.model) {
+              this.post({ type: "options", model: event.model });
+            }
+            break;
+          case "permission_request":
+            this.post({
+              type: "permission",
+              requestId: event.request_id,
+              toolName: event.tool_name,
+              description: event.description,
+              turnId,
+            });
+            break;
+          default:
+            break;
         }
       },
     });
@@ -936,11 +1453,7 @@ class JcodeChatViewProvider {
 
   async cancel() {
     this.cancelRequested = true;
-    const cancelledTurnId = this.activeTurnId;
     if (!clientPromise) {
-      this.activeTurnId = undefined;
-      this.running = false;
-      this.post({ type: "running", running: false, turnId: cancelledTurnId });
       return;
     }
     try {
@@ -948,51 +1461,26 @@ class JcodeChatViewProvider {
       if (this.sessionId) {
         await client.cancel(this.sessionId);
       }
-    } catch {
-      // The daemon may already have finished the turn; nothing to cancel.
-    } finally {
-      if (this.activeTurnId === cancelledTurnId) {
-        this.activeTurnId = undefined;
-        this.running = false;
-        this.post({ type: "running", running: false, turnId: cancelledTurnId });
-      }
+    } catch (error) {
+      log(`cancel failed: ${errorMessage(error)}`);
     }
   }
 
   async newChat() {
-    await this.cancel();
-    if (this.sessionInitPromise) {
-      try {
-        await this.sessionInitPromise;
-      } catch {
-        // A failed initialization should not prevent creating a fresh session.
-      }
+    if (this.running) {
+      await this.cancel();
     }
-    this.pendingSelection = undefined;
-    this.attachments.clear();
     this.sessionId = undefined;
     this.sessionClient = undefined;
+    this.sessionInitPromise = undefined;
+    this.attachments.clear();
     await this.context.workspaceState.update(CHAT_SESSION_KEY, undefined);
     this.post({ type: "cleared" });
-    this.post({ type: "options", model: this.getSelectedModel(), effort: this.getSelectedEffort() });
-  }
-
-  post(message) {
-    const view = this.view;
-    if (!view || this.disposed) return;
-    this.postChain = this.postChain
-      .then(() => this.view === view ? view.webview.postMessage(message) : false)
-      .catch(() => false);
+    this.post({ type: "notice", text: "New chat. The next message creates a fresh session." });
   }
 
   dispose() {
     this.disposed = true;
-    if (this.modelWatcher && this.modelWatcherClient) {
-      this.modelWatcherClient.off("model_info", this.modelWatcher);
-      this.modelWatcher = undefined;
-      this.modelWatcherClient = undefined;
-    }
-    void this.cancel();
   }
 }
 
@@ -1002,7 +1490,37 @@ function publicAttachment(attachment) {
     name: attachment.name,
     size: attachment.size,
     kind: attachment.kind,
+    mediaType: attachment.mediaType,
   };
+}
+
+function runJcodeCli(executable, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, {
+      env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => {
+      reject(error);
+    });
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout);
+      } else {
+        reject(new Error(`${stderr.trim() || stdout.trim() || `exit code ${code}`}`.slice(0, 500)));
+      }
+    });
+  });
 }
 
 async function captureSelectionContext(context, warnWhenMissing) {
@@ -1118,7 +1636,7 @@ function openJcodeTerminal(context, editor = getCurrentTextEditor()) {
   }
 
   const config = vscode.workspace.getConfiguration("jcode");
-  const executable = config.get("executablePath", "jcode");
+  const executable = resolveJcodeExecutable(config.get("executablePath", "jcode"));
   const configuredArguments = config.get("launchArguments", []);
   const cwd = getWorkingDirectory(editor);
   const args = cwd ? ["-C", cwd, ...configuredArguments] : configuredArguments;
@@ -1166,113 +1684,23 @@ function formatRange(selection) {
   return `L${start.line + 1}:C${start.character + 1}-L${end.line + 1}:C${end.character + 1}`;
 }
 
-function getChatHtml(webview) {
+function getChatHtml(webview, context) {
   const nonce = getNonce();
+  const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "media", "style.css"));
+  const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "media", "chat.js"));
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; img-src ${webview.cspSource} data:; script-src ${webview.cspSource} 'nonce-${nonce}';">
   <title>Jcode Chat</title>
-  <style>
-    :root { color-scheme: light dark; --accent: #d97757; --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent); }
-    * { box-sizing: border-box; }
-    body { margin: 0; height: 100vh; overflow: hidden; color: var(--vscode-foreground); background: var(--vscode-sideBar-background); font: 13px/1.5 var(--vscode-font-family); }
-    button, textarea, input, select { font: inherit; }
-    button, input, select, textarea { color: inherit; }
-    button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 2px; }
-    .app { display: flex; flex-direction: column; height: 100%; min-width: 230px; }
-    .topbar { display: flex; align-items: center; justify-content: space-between; min-height: 42px; padding: 7px 8px 7px 12px; border-bottom: 1px solid var(--vscode-panel-border); }
-    .brand { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 600; }
-    .brand-mark { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; color: #fff; background: var(--accent); font-weight: 700; font-size: 12px; }
-    .brand-copy { display: flex; flex-direction: column; min-width: 0; line-height: 1.1; }
-    .brand-copy small { color: var(--vscode-descriptionForeground); font-size: 10px; font-weight: 400; }
-    .top-actions { display: flex; gap: 2px; }
-    .icon-btn { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 6px; color: var(--vscode-icon-foreground); background: transparent; cursor: pointer; }
-    .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
-    .icon-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
-    .messages { flex: 1; overflow-y: auto; padding: 14px 12px 24px; scroll-padding-bottom: 24px; }
-    .welcome { max-width: 420px; margin: max(38px, 10vh) auto 0; }
-    .welcome-mark { display: grid; place-items: center; width: 36px; height: 36px; margin-bottom: 15px; border-radius: 10px; color: #fff; background: var(--accent); font-size: 19px; }
-    .welcome h1 { margin: 0 0 6px; font-size: 19px; line-height: 1.25; font-weight: 600; letter-spacing: -.2px; }
-    .welcome p { margin: 0 0 18px; color: var(--vscode-descriptionForeground); }
-    .starters { display: grid; gap: 7px; }
-    .starter { display: flex; align-items: center; gap: 9px; width: 100%; padding: 9px 10px; border: 1px solid var(--vscode-widget-border); border-radius: 9px; color: var(--vscode-foreground); background: color-mix(in srgb, var(--vscode-editorWidget-background) 58%, transparent); text-align: left; cursor: pointer; }
-    .starter:hover { border-color: color-mix(in srgb, var(--accent) 48%, var(--vscode-widget-border)); background: var(--accent-soft); }
-    .starter-icon { color: var(--accent); font-size: 15px; }
-    .chat { margin: 0 auto 18px; max-width: 760px; }
-    .chat-header { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; color: var(--vscode-descriptionForeground); font-size: 11px; font-weight: 500; }
-    .avatar { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 6px; color: #fff; background: var(--accent); font-size: 10px; font-weight: 700; }
-    .chat-user .avatar { color: var(--vscode-foreground); background: var(--vscode-badge-background); }
-    .chat-bubble { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
-    .chat-user .chat-bubble { padding: 10px 11px; border: 1px solid var(--vscode-widget-border); border-radius: 10px; background: color-mix(in srgb, var(--vscode-editorWidget-background) 78%, transparent); }
-    .chat-assistant .chat-bubble { padding: 1px 2px; }
-    .chat-footer { margin-top: 7px; color: var(--vscode-descriptionForeground); font-size: 10px; }
-    .message-attachments { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 7px; }
-    .message-file { display: inline-flex; align-items: center; gap: 5px; max-width: 210px; padding: 4px 7px; border: 1px solid var(--vscode-widget-border); border-radius: 6px; color: var(--vscode-descriptionForeground); background: var(--vscode-editorWidget-background); font-size: 10px; }
-    .message-file span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .notice { max-width: 680px; margin: 12px auto; padding: 7px 9px; border-radius: 7px; color: var(--vscode-descriptionForeground); background: color-mix(in srgb, var(--vscode-editorWidget-background) 65%, transparent); font-size: 11px; text-align: center; }
-    .notice.error { color: var(--vscode-errorForeground); background: color-mix(in srgb, var(--vscode-inputValidation-errorBackground) 60%, transparent); }
-    .command-card { max-width: 680px; margin: 12px auto; overflow: hidden; border: 1px solid var(--vscode-widget-border); border-radius: 9px; background: var(--vscode-editorWidget-background); }
-    .command-title { padding: 8px 10px; border-bottom: 1px solid var(--vscode-widget-border); font-weight: 600; }
-    .command-row { display: grid; grid-template-columns: minmax(74px, auto) 1fr; gap: 10px; padding: 6px 10px; border-bottom: 1px solid color-mix(in srgb, var(--vscode-widget-border) 55%, transparent); font-size: 11px; }
-    .command-row:last-child { border-bottom: 0; }
-    .command-row code { color: var(--accent); font-family: var(--vscode-editor-font-family); }
-    .command-row span:last-child { color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
-    .typing { display: inline-flex; gap: 4px; align-items: center; min-height: 24px; }
-    .typing i { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); animation: pulse 1.2s infinite; }
-    .typing i:nth-child(2) { animation-delay: .16s; }
-    .typing i:nth-child(3) { animation-delay: .32s; }
-    @keyframes pulse { 0%, 60%, 100% { opacity: .3; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
-    .composer-zone { position: relative; padding: 0 8px 9px; background: linear-gradient(transparent, var(--vscode-sideBar-background) 14px); }
-    .selection-chip { display: none; align-items: center; gap: 6px; max-width: 100%; margin: 0 4px 6px; padding: 4px 8px; border-radius: 6px; color: var(--vscode-descriptionForeground); background: var(--vscode-editor-inactiveSelectionBackground); font-size: 10px; }
-    .selection-chip.visible { display: flex; }
-    .selection-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .composer { position: relative; border: 1px solid var(--vscode-input-border, var(--vscode-widget-border)); border-radius: 12px; background: var(--vscode-input-background); box-shadow: 0 4px 18px rgba(0,0,0,.10); }
-    .composer:focus-within { border-color: color-mix(in srgb, var(--accent) 62%, var(--vscode-focusBorder)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 20%, transparent), 0 5px 22px rgba(0,0,0,.14); }
-    .pending-attachments { display: none; flex-wrap: wrap; gap: 6px; padding: 8px 8px 0; }
-    .pending-attachments.visible { display: flex; }
-    .attachment-chip { display: flex; align-items: center; gap: 6px; min-width: 0; max-width: 190px; padding: 5px 6px 5px 8px; border: 1px solid var(--vscode-widget-border); border-radius: 7px; background: var(--vscode-editorWidget-background); font-size: 10px; }
-    .attachment-chip .attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .attachment-chip .attachment-kind { color: var(--accent); }
-    .attachment-remove { display: grid; place-items: center; width: 16px; height: 16px; padding: 0; border: 0; border-radius: 4px; color: var(--vscode-descriptionForeground); background: transparent; cursor: pointer; }
-    .attachment-remove:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
-    .prompt { display: block; width: 100%; min-height: 62px; max-height: 200px; resize: none; border: 0; outline: 0; padding: 10px 11px 4px; color: var(--vscode-input-foreground); background: transparent; line-height: 1.45; }
-    .prompt::placeholder { color: var(--vscode-input-placeholderForeground); opacity: 1; }
-    .composer-tools { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 5px 6px 6px; }
-    .tool-left, .tool-right { display: flex; align-items: center; gap: 3px; min-width: 0; }
-    .small-btn { display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 26px; padding: 0 7px; border: 0; border-radius: 6px; color: var(--vscode-descriptionForeground); background: transparent; font-size: 10px; cursor: pointer; }
-    .small-btn:hover, .small-btn.active { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
-    .small-btn.active { color: var(--accent); }
-    .small-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-    .model-input, .effort-select { height: 26px; border: 0; border-radius: 6px; color: var(--vscode-descriptionForeground); background: transparent; font-size: 10px; }
-    .model-input { width: min(128px, 34vw); padding: 0 7px; }
-    .model-input:hover, .model-input:focus, .effort-select:hover, .effort-select:focus { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); outline: 0; }
-    .effort-select { max-width: 82px; padding: 0 3px; }
-    .send-btn { display: grid; place-items: center; width: 27px; height: 27px; padding: 0; border: 0; border-radius: 7px; color: #fff; background: var(--accent); cursor: pointer; }
-    .send-btn:hover { filter: brightness(1.08); }
-    .send-btn:disabled { opacity: .45; cursor: default; }
-    .send-btn svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-    #cancel { display: none; background: var(--vscode-errorForeground); }
-    body.running #send { display: none; }
-    body.running #cancel { display: grid; }
-    .slash-menu { display: none; position: absolute; left: 12px; right: 12px; bottom: calc(100% - 4px); z-index: 10; max-height: min(320px, 48vh); overflow-y: auto; padding: 5px; border: 1px solid var(--vscode-widget-border); border-radius: 10px; background: var(--vscode-editorWidget-background); box-shadow: 0 8px 30px rgba(0,0,0,.28); }
-    .slash-menu.visible { display: block; }
-    .slash-item { display: grid; grid-template-columns: minmax(76px, auto) 1fr; gap: 10px; width: 100%; padding: 7px 8px; border: 0; border-radius: 6px; color: var(--vscode-foreground); background: transparent; text-align: left; cursor: pointer; }
-    .slash-item:hover, .slash-item.selected { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
-    .slash-item code { font-family: var(--vscode-editor-font-family); font-size: 11px; font-weight: 600; }
-    .slash-item span { color: var(--vscode-descriptionForeground); font-size: 10px; }
-    .slash-item.selected span { color: inherit; opacity: .8; }
-    .composer-hint { margin: 5px 4px 0; color: var(--vscode-descriptionForeground); font-size: 9px; text-align: center; }
-    @media (max-width: 300px) { .model-input { width: 80px; } .small-btn span { display: none; } }
-    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; } }
-  </style>
+  <link rel="stylesheet" href="${styleUri}">
 </head>
 <body>
   <main class="app">
     <header class="topbar">
-      <div class="brand"><span class="brand-mark">J</span><span class="brand-copy"><span>Jcode</span><small id="session-status">Connecting…</small></span></div>
+      <div class="brand"><span class="brand-mark">J</span><span class="brand-copy"><span class="title">Jcode</span><small id="session-status">Connecting…</small></span></div>
       <div class="top-actions">
         <button id="terminal" class="icon-btn" title="Open terminal agent" aria-label="Open terminal agent"><svg viewBox="0 0 24 24"><path d="m5 7 4 4-4 4M11 17h7"/></svg></button>
         <button id="new-chat" class="icon-btn" title="New chat" aria-label="New chat"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
@@ -1312,485 +1740,22 @@ function getChatHtml(webview) {
       <div class="composer-hint">Enter to send · Shift+Enter for a new line · paste images directly</div>
     </footer>
   </main>
-  <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
-    const messages = document.getElementById("messages");
-    const empty = document.getElementById("empty");
-    const prompt = document.getElementById("prompt");
-    const selection = document.getElementById("selection");
-    const selectionLabel = document.getElementById("selection-label");
-    const selectionToggle = document.getElementById("selection-toggle");
-    const attachmentList = document.getElementById("attachments");
-    const slashMenu = document.getElementById("slash-menu");
-    const modelInput = document.getElementById("model");
-    const effortSelect = document.getElementById("effort");
-    const saved = vscode.getState() || { messages: [] };
-    let liveBubble;
-    let attachments = [];
-    let slashCommands = [];
-    let slashMatches = [];
-    let slashIndex = 0;
-    let includeSelection = true;
-    let submitting = false;
-    let pendingDraft = "";
-    let activeTurnId;
-    const closedTurnIds = new Set();
-    let pendingPastes = 0;
-
-    function persist() {
-      const items = [...messages.querySelectorAll(".chat[data-role]")].map(function (item) {
-        return {
-          role: item.dataset.role,
-          text: item.querySelector(".chat-bubble").textContent,
-          meta: item.querySelector(".chat-footer")?.textContent || "",
-          attachments: JSON.parse(item.dataset.attachments || "[]"),
-        };
-      });
-      vscode.setState({ messages: items });
-    }
-
-    function attachmentIcon(kind) { return kind === "image" ? "▧" : "▤"; }
-
-    function createMessageAttachments(items) {
-      if (!items || !items.length) return undefined;
-      const wrap = document.createElement("div");
-      wrap.className = "message-attachments";
-      items.forEach(function (file) {
-        const chip = document.createElement("div");
-        chip.className = "message-file";
-        const icon = document.createElement("b");
-        icon.textContent = attachmentIcon(file.kind);
-        const name = document.createElement("span");
-        name.textContent = file.name;
-        chip.append(icon, name);
-        wrap.append(chip);
-      });
-      return wrap;
-    }
-
-    function appendMessage(role, text, meta, files) {
-      empty.hidden = true;
-      const item = document.createElement("article");
-      item.className = "chat " + (role === "user" ? "chat-user" : "chat-assistant");
-      item.dataset.role = role;
-      item.dataset.attachments = JSON.stringify(files || []);
-      const header = document.createElement("div");
-      header.className = "chat-header";
-      const avatar = document.createElement("span");
-      avatar.className = "avatar";
-      avatar.textContent = role === "user" ? "Y" : "J";
-      const label = document.createElement("span");
-      label.textContent = role === "user" ? "You" : "Jcode";
-      header.append(avatar, label);
-      const bubble = document.createElement("div");
-      bubble.className = "chat-bubble";
-      bubble.textContent = text;
-      item.append(header);
-      const fileWrap = createMessageAttachments(files);
-      if (fileWrap) item.append(fileWrap);
-      item.append(bubble);
-      if (meta) {
-        const footer = document.createElement("div");
-        footer.className = "chat-footer";
-        footer.textContent = meta;
-        item.append(footer);
-      }
-      messages.append(item);
-      messages.scrollTop = messages.scrollHeight;
-      persist();
-    }
-
-    function createLiveBubble() {
-      empty.hidden = true;
-      document.getElementById("typing")?.remove();
-      const item = document.createElement("article");
-      item.className = "chat chat-assistant";
-      item.dataset.role = "assistant";
-      item.dataset.attachments = "[]";
-      const header = document.createElement("div");
-      header.className = "chat-header";
-      header.innerHTML = '<span class="avatar">J</span><span>Jcode</span>';
-      const bubble = document.createElement("div");
-      bubble.className = "chat-bubble";
-      const footer = document.createElement("div");
-      footer.className = "chat-footer";
-      item.append(header, bubble, footer);
-      messages.append(item);
-      messages.scrollTop = messages.scrollHeight;
-      return { item: item, bubble: bubble, footer: footer };
-    }
-
-    function finalizeLiveBubble(meta) {
-      if (!liveBubble) return;
-      liveBubble.footer.textContent = meta || "";
-      liveBubble = undefined;
-      persist();
-    }
-
-    function appendNotice(text, isError) {
-      empty.hidden = true;
-      const notice = document.createElement("div");
-      notice.className = "notice" + (isError ? " error" : "");
-      notice.textContent = text;
-      messages.append(notice);
-      messages.scrollTop = messages.scrollHeight;
-    }
-
-    function appendCommandCard(title, rows) {
-      empty.hidden = true;
-      const card = document.createElement("section");
-      card.className = "command-card";
-      const heading = document.createElement("div");
-      heading.className = "command-title";
-      heading.textContent = title;
-      card.append(heading);
-      (rows || []).forEach(function (row) {
-        const line = document.createElement("div");
-        line.className = "command-row";
-        const key = document.createElement("code");
-        key.textContent = row[0];
-        const value = document.createElement("span");
-        value.textContent = row[1];
-        line.append(key, value);
-        card.append(line);
-      });
-      messages.append(card);
-      messages.scrollTop = messages.scrollHeight;
-    }
-
-    function setSelection(label) {
-      selectionLabel.textContent = label || "";
-      selection.title = label || "";
-      selection.classList.toggle("visible", Boolean(label) && includeSelection);
-    }
-
-    function formatBytes(size) {
-      if (!size) return "";
-      if (size < 1024) return size + " B";
-      if (size < 1024 * 1024) return Math.round(size / 1024) + " KB";
-      return (size / (1024 * 1024)).toFixed(1) + " MB";
-    }
-
-    function renderAttachments(items) {
-      attachments = items || [];
-      attachmentList.replaceChildren();
-      attachments.forEach(function (file) {
-        const chip = document.createElement("div");
-        chip.className = "attachment-chip";
-        chip.title = file.name + (file.size ? " · " + formatBytes(file.size) : "");
-        const kind = document.createElement("span");
-        kind.className = "attachment-kind";
-        kind.textContent = attachmentIcon(file.kind);
-        const name = document.createElement("span");
-        name.className = "attachment-name";
-        name.textContent = file.name;
-        const remove = document.createElement("button");
-        remove.className = "attachment-remove";
-        remove.type = "button";
-        remove.textContent = "×";
-        remove.title = "Remove attachment";
-        remove.setAttribute("aria-label", "Remove " + file.name);
-        remove.addEventListener("click", function () { vscode.postMessage({ type: "removeAttachment", id: file.id }); });
-        chip.append(kind, name, remove);
-        attachmentList.append(chip);
-      });
-      attachmentList.classList.toggle("visible", attachments.length > 0);
-    }
-
-    function populateModelOptions(models, selected) {
-      const names = [...new Set((models || []).filter(Boolean))];
-      modelInput.replaceChildren();
-      const auto = document.createElement("option");
-      auto.value = "";
-      auto.textContent = "Model: auto";
-      modelInput.append(auto);
-      if (selected && !names.includes(selected)) names.unshift(selected);
-      names.forEach(function (name) {
-        const option = document.createElement("option");
-        option.value = name;
-        option.textContent = name;
-        modelInput.append(option);
-      });
-      modelInput.value = selected || "";
-    }
-
-    function populateEffortOptions(levels) {
-      effortSelect.replaceChildren();
-      const auto = document.createElement("option");
-      auto.value = "";
-      auto.textContent = "auto";
-      effortSelect.append(auto);
-      (levels || []).forEach(function (level) {
-        const option = document.createElement("option");
-        option.value = level;
-        option.textContent = level;
-        effortSelect.append(option);
-      });
-    }
-
-    function applyOptions(data) {
-      populateModelOptions(data.models || [], data.model !== undefined ? data.model : modelInput.value);
-      populateEffortOptions(data.effortLevels || []);
-      if (data.effort !== undefined) effortSelect.value = data.effort;
-    }
-
-    function setRunning(running) {
-      document.body.classList.toggle("running", running);
-      prompt.disabled = running;
-      modelInput.disabled = running;
-      effortSelect.disabled = running;
-      document.getElementById("attach").disabled = running;
-      let typing = document.getElementById("typing");
-      if (running && !typing) {
-        typing = document.createElement("article");
-        typing.id = "typing";
-        typing.className = "chat chat-assistant";
-        typing.innerHTML = '<div class="chat-header"><span class="avatar">J</span><span>Jcode</span></div><div class="typing" aria-label="Jcode is responding"><i></i><i></i><i></i></div>';
-        messages.append(typing);
-        messages.scrollTop = messages.scrollHeight;
-      } else if (!running) {
-        typing?.remove();
-        finalizeLiveBubble();
-      }
-    }
-
-    function resizePrompt() {
-      prompt.style.height = "auto";
-      prompt.style.height = Math.min(prompt.scrollHeight, 200) + "px";
-    }
-
-    function commandQuery() {
-      const value = prompt.value.trimStart();
-      if (!value.startsWith("/") || value.includes("\n") || /\s/.test(value)) return undefined;
-      return value.toLowerCase();
-    }
-
-    function renderSlashMenu() {
-      const query = commandQuery();
-      slashMenu.replaceChildren();
-      if (query === undefined) {
-        slashMatches = [];
-        slashMenu.classList.remove("visible");
-        return;
-      }
-      slashMatches = slashCommands.filter(function (command) {
-        return command.name.toLowerCase().startsWith(query) || command.name.toLowerCase().includes(query.slice(1));
-      }).slice(0, 9);
-      slashIndex = Math.min(slashIndex, Math.max(0, slashMatches.length - 1));
-      slashMatches.forEach(function (command, index) {
-        const item = document.createElement("button");
-        item.className = "slash-item" + (index === slashIndex ? " selected" : "");
-        item.type = "button";
-        item.setAttribute("role", "option");
-        item.setAttribute("aria-selected", index === slashIndex ? "true" : "false");
-        const name = document.createElement("code");
-        name.textContent = command.usage || command.name;
-        const description = document.createElement("span");
-        description.textContent = command.description;
-        item.append(name, description);
-        item.addEventListener("mousedown", function (event) { event.preventDefault(); acceptSlash(index); });
-        slashMenu.append(item);
-      });
-      slashMenu.classList.toggle("visible", slashMatches.length > 0);
-    }
-
-    function acceptSlash(index) {
-      const command = slashMatches[index];
-      if (!command) return false;
-      const current = prompt.value.trim();
-      if (current === command.name && !command.usage) return false;
-      prompt.value = command.name + (command.usage ? " " : "");
-      prompt.focus();
-      slashIndex = 0;
-      resizePrompt();
-      renderSlashMenu();
-      return true;
-    }
-
-    function send() {
-      const text = prompt.value.trim();
-      if (!text || submitting || document.body.classList.contains("running")) return;
-      if (pendingPastes > 0) {
-        appendNotice("Wait for the pasted image to finish attaching.", false);
-        return;
-      }
-      submitting = true;
-      pendingDraft = prompt.value;
-      document.getElementById("send").disabled = true;
-      vscode.postMessage({
-        type: "send",
-        text: text,
-        includeSelection: includeSelection,
-        model: modelInput.value.trim(),
-        effort: effortSelect.value,
-        attachmentIds: attachments.map(function (file) { return file.id; }),
-      });
-      prompt.value = "";
-      slashMenu.classList.remove("visible");
-      resizePrompt();
-    }
-
-    (saved.messages || []).forEach(function (item) { appendMessage(item.role, item.text, item.meta, item.attachments); });
-    empty.hidden = Boolean((saved.messages || []).length);
-
-    document.querySelectorAll(".starter").forEach(function (button) {
-      button.addEventListener("click", function () { prompt.value = button.dataset.prompt || ""; resizePrompt(); prompt.focus(); });
-    });
-    prompt.addEventListener("input", function () { resizePrompt(); slashIndex = 0; renderSlashMenu(); });
-    prompt.addEventListener("keydown", function (event) {
-      if (slashMenu.classList.contains("visible") && slashMatches.length) {
-        if (event.key === "ArrowDown") { event.preventDefault(); slashIndex = (slashIndex + 1) % slashMatches.length; renderSlashMenu(); return; }
-        if (event.key === "ArrowUp") { event.preventDefault(); slashIndex = (slashIndex - 1 + slashMatches.length) % slashMatches.length; renderSlashMenu(); return; }
-        if (event.key === "Tab") { event.preventDefault(); acceptSlash(slashIndex); return; }
-        if (event.key === "Escape") { event.preventDefault(); slashMenu.classList.remove("visible"); return; }
-        if (event.key === "Enter" && !event.shiftKey) {
-          const exact = slashMatches.find(function (command) { return command.name === prompt.value.trim(); });
-          if (!exact && acceptSlash(slashIndex)) { event.preventDefault(); return; }
-        }
-      }
-      if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); }
-    });
-    prompt.addEventListener("paste", function (event) {
-      const files = [...(event.clipboardData?.files || [])].filter(function (file) { return file.type.startsWith("image/"); });
-      files.forEach(function (file) {
-        pendingPastes += 1;
-        const reader = new FileReader();
-        reader.addEventListener("load", function () {
-          const result = String(reader.result || "");
-          vscode.postMessage({ type: "addPastedImage", name: file.name || "Pasted image", mediaType: file.type, data: result.split(",")[1] || "" });
-          pendingPastes -= 1;
-        });
-        reader.addEventListener("error", function () { pendingPastes -= 1; appendNotice("Could not read the pasted image.", true); });
-        reader.readAsDataURL(file);
-      });
-    });
-
-    document.getElementById("send").addEventListener("click", send);
-    document.getElementById("cancel").addEventListener("click", function () { vscode.postMessage({ type: "cancel" }); });
-    document.getElementById("new-chat").addEventListener("click", function () { vscode.postMessage({ type: "newChat" }); });
-    document.getElementById("terminal").addEventListener("click", function () { vscode.postMessage({ type: "openTerminal" }); });
-    document.getElementById("attach").addEventListener("click", function () { vscode.postMessage({ type: "chooseAttachments" }); });
-    selectionToggle.addEventListener("click", function () {
-      includeSelection = !includeSelection;
-      selectionToggle.classList.toggle("active", includeSelection);
-      selectionToggle.setAttribute("aria-pressed", includeSelection ? "true" : "false");
-      selection.classList.toggle("visible", includeSelection && Boolean(selectionLabel.textContent));
-    });
-    modelInput.addEventListener("change", function () { vscode.postMessage({ type: "model", model: modelInput.value.trim() }); });
-    effortSelect.addEventListener("change", function () { vscode.postMessage({ type: "effort", effort: effortSelect.value }); });
-    window.addEventListener("keydown", function (event) {
-      if (event.key === "Escape" && document.body.classList.contains("running")) {
-        event.preventDefault();
-        vscode.postMessage({ type: "cancel" });
-      }
-    });
-
-    window.addEventListener("message", function (event) {
-      const data = event.data;
-      switch (data.type) {
-        case "restore":
-          setSelection(data.selection);
-          applyOptions(data);
-          slashCommands = data.slashCommands || [];
-          renderAttachments(data.attachments || []);
-          document.getElementById("session-status").textContent = data.error ? "Disconnected" : "Ready";
-          if (data.error) appendNotice(data.error, true);
-          break;
-        case "bootstrap":
-          setSelection(data.selection);
-          applyOptions(data);
-          slashCommands = data.slashCommands || [];
-          renderAttachments(data.attachments || []);
-          document.getElementById("session-status").textContent = "Connecting…";
-          break;
-        case "selection": setSelection(data.selection); if (data.focusComposer) prompt.focus(); break;
-        case "attachments": renderAttachments(data.attachments); break;
-        case "options": if (data.model !== undefined) populateModelOptions([...modelInput.options].map(function (option) { return option.value; }), data.model); if (data.effort !== undefined) effortSelect.value = data.effort; break;
-        case "user":
-          if (data.turnId !== undefined) activeTurnId = data.turnId;
-          appendMessage("user", data.text, data.selection || "", data.attachments || []);
-          setSelection("");
-          break;
-        case "sendAccepted":
-        case "sendHandled":
-          submitting = false;
-          pendingDraft = "";
-          document.getElementById("send").disabled = false;
-          break;
-        case "sendRejected":
-          submitting = false;
-          if (!prompt.value && pendingDraft) prompt.value = pendingDraft;
-          pendingDraft = "";
-          document.getElementById("send").disabled = false;
-          resizePrompt();
-          break;
-        case "delta": if (data.turnId !== undefined && (closedTurnIds.has(data.turnId) || (activeTurnId !== undefined && data.turnId !== activeTurnId))) break; if (!liveBubble) liveBubble = createLiveBubble(); liveBubble.bubble.textContent += data.text; messages.scrollTop = messages.scrollHeight; break;
-        case "assistant":
-          if (data.turnId !== undefined && (closedTurnIds.has(data.turnId) || (activeTurnId !== undefined && data.turnId !== activeTurnId))) break;
-          if (liveBubble) { liveBubble.bubble.textContent = data.text; liveBubble.footer.textContent = [data.provider, data.model].filter(Boolean).join(" · "); liveBubble = undefined; persist(); }
-          else appendMessage("assistant", data.text, [data.provider, data.model].filter(Boolean).join(" · "), []);
-          break;
-        case "notice": appendNotice(data.text, false); break;
-        case "error": appendNotice(data.text, true); break;
-        case "running":
-          if (data.running) activeTurnId = data.turnId;
-          else if (data.turnId !== undefined && data.turnId !== activeTurnId) break;
-          if (!data.running) {
-            if (data.turnId !== undefined) closedTurnIds.add(data.turnId);
-            activeTurnId = undefined;
-          }
-          setRunning(data.running);
-          document.getElementById("session-status").textContent = data.running ? "Working…" : "Ready";
-          break;
-        case "commandHelp": appendCommandCard("Jcode commands", (data.commands || []).map(function (command) { return [command.usage || command.name, command.description]; })); break;
-        case "commandInfo": appendCommandCard(data.title || "Info", data.rows || []); break;
-        case "openModelPicker": modelInput.focus(); break;
-        case "openEffortPicker": effortSelect.focus(); break;
-        case "cleared":
-          activeTurnId = undefined;
-          closedTurnIds.clear();
-          submitting = false;
-          pendingDraft = "";
-          document.getElementById("send").disabled = false;
-          liveBubble = undefined;
-          messages.querySelectorAll(":scope > :not(#empty)").forEach(function (node) { node.remove(); });
-          empty.hidden = false;
-          setSelection("");
-          renderAttachments([]);
-          vscode.setState({ messages: [] });
-          prompt.focus();
-          break;
-      }
-    });
-
-    vscode.postMessage({ type: "ready", hasHistory: Boolean((saved.messages || []).length) });
-  </script>
+  <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
 }
+
 function getNonce() {
-  return crypto.randomBytes(24).toString("base64");
+  return crypto.randomBytes(16).toString("base64").replace(/[+/=]/g, "");
 }
 
 function deactivate() {
-  if (bridgeProcess && bridgeProcess.exitCode === null && bridgeProcess.signalCode === null) {
-    try {
-      bridgeProcess.kill();
-    } catch {
-      // Already gone.
-    }
-    bridgeProcess = undefined;
-  }
-  if (clientPromise) {
-    clientPromise.then((client) => {
-      try {
-        client.close();
-      } catch {
-        // Already closed.
-      }
-    }).catch(() => {});
-    clientPromise = undefined;
+  if (currentClient && !currentClient.closed) {
+    void currentClient.close();
   }
 }
 
-module.exports = { activate, deactivate, JcodeChatViewProvider, captureSelectionContext };
+module.exports = {
+  activate,
+  deactivate,
+};

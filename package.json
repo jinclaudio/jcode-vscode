@@ -1,8 +1,8 @@
 {
   "name": "jcode-vscode",
   "displayName": "Jcode",
-  "description": "Chat with Jcode in the VS Code sidebar and send the active editor selection as context.",
-  "version": "0.5.1",
+  "description": "Full Jcode agent wrapper: sidebar chat, editor context, session management, and slash commands over the official jcode SDK (api-bridge).",
+  "version": "0.6.0",
   "publisher": "jcode",
   "license": "MIT",
   "repository": {
@@ -29,6 +29,10 @@
       {
         "command": "jcode.open",
         "title": "Jcode: Open Chat"
+      },
+      {
+        "command": "jcode.diagnose",
+        "title": "Jcode: Run Connection Diagnostics"
       },
       {
         "command": "jcode.openTerminal",
@@ -90,6 +94,9 @@
           "command": "jcode.open"
         },
         {
+          "command": "jcode.diagnose"
+        },
+        {
           "command": "jcode.openTerminal"
         },
         {
@@ -146,6 +153,21 @@
           "default": [],
           "markdownDescription": "Fallback model names for the sidebar chat model picker when Jcode's live model catalog is unreachable. When empty, a built-in curated list is used. The picker normally lists the real catalog from the connected Jcode daemon (`listModels`)."
         },
+        "jcode.apiSocketPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Override the harness API socket path used by the sidebar chat. Leave empty for the default (extension storage, or the `JCODE_API_SOCKET` environment variable when set)."
+        },
+        "jcode.autoApprove": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Automatically allow permission prompts issued by the agent. When disabled, permission requests surface in the chat for you to approve or deny. (The current api-bridge does not yet advertise the `permissions` capability, so this is a no-op until it does.)"
+        },
+        "jcode.shareEditorContext": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Include a compact summary of the active editor, selection, and open files with each sidebar message so the agent knows what you are looking at in VS Code."
+        },
         "jcode.defaultEffort": {
           "type": "string",
           "enum": [
@@ -165,7 +187,8 @@
     }
   },
   "scripts": {
-    "check": "node --check extension.js",
+    "check": "node --check extension.js && node --check media/chat.js",
+    "check:webview": "node scripts/check-webview.js",
     "test:acceptance": "node scripts/run-acceptance.js",
     "package": "npx @vscode/vsce package"
   },

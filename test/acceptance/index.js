@@ -325,7 +325,7 @@ async function run() {
     frames.some(
       (frame) =>
         frame.req === "send_message" &&
-        frame.content === "Continue without attaching a selection." &&
+        frame.content.startsWith("Continue without attaching a selection.") &&
         frame.session_id === "fake-session-1",
     ),
   );
@@ -397,7 +397,7 @@ async function run() {
   assert.match(imageResult.text, /FAKE_CHAT_RESPONSE/);
   frames = await readBridgeFrames(bridgeLog);
   const imageSend = frames.find(
-    (frame) => frame.req === "send_message" && frame.content === "Describe the attached image.",
+    (frame) => frame.req === "send_message" && frame.content.startsWith("Describe the attached image."),
   );
   assert.deepEqual(imageSend.images, [["image/png", Buffer.from("hello").toString("base64")]]);
 
@@ -410,7 +410,7 @@ async function run() {
   frames = await readBridgeFrames(bridgeLog);
   assert.ok(
     frames.some(
-      (frame) => frame.req === "send_message" && frame.content === "/path/to/file fails; explain why.",
+      (frame) => frame.req === "send_message" && frame.content.startsWith("/path/to/file fails; explain why."),
     ),
     "a // prefix must escape a literal leading slash",
   );
@@ -521,7 +521,7 @@ async function run() {
   );
   await waitFor(async () => {
     const current = await readBridgeFrames(bridgeLog);
-    return current.some((frame) => frame.req === "send_message" && frame.content === "WAIT_FOR_CANCEL");
+    return current.some((frame) => frame.req === "send_message" && frame.content.startsWith("WAIT_FOR_CANCEL"));
   }, "cancellable message to be sent");
   const sendCountDuringTurn = (await readBridgeFrames(bridgeLog)).filter((frame) => frame.req === "send_message").length;
   const rejectedConcurrent = await vscode.commands.executeCommand(

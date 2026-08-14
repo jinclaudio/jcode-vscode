@@ -14,9 +14,27 @@ and lets the user explicitly send editor selections to the agent.
 - The composer supports file and image attachments, removable attachment chips, and
   direct clipboard image paste. Images use the SDK's native attachment field; other
   files are shared as exact local paths for Jcode to read.
-- Type `/` for command autocomplete. The sidebar maps `/model`, `/models`, `/effort`,
-  `/clear`, `/compact`, `/rename`, `/info`, `/cancel`, and `/help` to SDK/session
-  operations. Prefix a prompt with `//` when it must begin with a literal `/`.
+- Type `/` for command autocomplete backed by the full TUI slash-command catalog
+  (from jcode's `REGISTERED_COMMANDS`). Commands run in five ways: **native**
+  (SDK operations like `/model`, `/effort`, `/clear`, `/compact`, `/rewind`,
+  `/rename`, `/info`, `/resume` session picker), **prompt** (the same synthetic
+  user-turn templates the TUI uses, e.g. `/commit`, `/plan`, `/fix`, `/test`),
+  **cli** (`jcode <subcommand>` output cards, e.g. `/usage`, `/memory`,
+  `/telemetry`, `/version`), **local** (extension state, e.g. `/save`,
+  `/unsave` bookmarks, `/config`), and **terminal** (opens the terminal agent
+  with the command prefilled, e.g. `/login`, `/update`, `/permissions`). Prefix
+  a prompt with `//` when it must begin with a literal `/`.
+- The sidebar chat renders streaming text, collapsible reasoning, tool-call
+  rows, and token usage, and surfaces permission requests when the bridge
+  advertises the `permissions` capability.
+- With `jcode.shareEditorContext` (default on), each message includes a compact
+  summary of the active editor, selection, open files, dirty files, and
+  workspace root, so the agent knows what you are looking at in VS Code.
+- `Jcode: Run Connection Diagnostics` (or `/diagnose` in the output channel)
+  prints executable, socket, protocol, provider, and session information.
+- The webview UI lives in `media/` (external `chat.js` / `style.css`, loaded via
+  `webview.asWebviewUri`), so its syntax is checked by `npm run check` and
+  `npm run check:webview` instead of failing silently at runtime.
 - The Chat page uses a compact Claude Code-inspired layout with a floating composer,
   starter prompts, attachment chips, command cards, and live connection status.
 - The Chat page has a model picker populated from Jcode's live model catalog and a
@@ -76,6 +94,21 @@ npm run test:acceptance
 On Linux CI, the same test can run under Xvfb by invoking VS Code with
 `--extensionDevelopmentPath` and `--extensionTestsPath`.
 
+## Troubleshooting
+
+If the chat stays on "Connecting…" or a message fails to send:
+
+1. Open the **Output** panel (`View → Output`) and pick the **Jcode** channel. It
+   logs every connection step: SDK loading, bridge startup (with the bridge's own
+   stderr), socket dialing, and chat send failures.
+2. If the bridge fails to start, the log shows why. Common causes:
+   - `jcode` is not on `PATH` and not in a probed location
+     (`~/.local/bin`, `~/.jcode/builds/current`, `/opt/homebrew/bin`,
+     `/usr/local/bin`). Set `jcode.executablePath` to the absolute path.
+   - The installed `jcode` is too old for `jcode api-bridge`; update it.
+3. The connection has hard timeouts (SDK load 10s, socket dial 5s, session
+   restore 45s), so a stuck state always becomes a visible error message.
+
 ## Configuration
 
 - `jcode.executablePath`: absolute path or command name for Jcode.
@@ -91,6 +124,14 @@ On Linux CI, the same test can run under Xvfb by invoking VS Code with
   Applied to new chat sessions through the SDK's `setReasoningEffort` and passed
   to the terminal agent through the `JCODE_OPENAI_REASONING_EFFORT` /
   `JCODE_ANTHROPIC_REASONING_EFFORT` environment variables.
+- `jcode.apiSocketPath`: override the harness API socket path the extension
+  connects to and starts the bridge on. Defaults to the extension's global
+  storage; `JCODE_API_SOCKET` (environment variable) wins over this setting.
+- `jcode.autoApprove`: automatically allow permission prompts issued by the
+  agent. Currently a no-op because the bridge does not yet advertise the
+  `permissions` capability.
+- `jcode.shareEditorContext`: include the active editor / open files summary in
+  each sidebar message.
 - `JCODE_API_SOCKET` (environment variable): overrides the harness API socket path
   the extension connects to and starts the bridge on.
 
