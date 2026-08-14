@@ -25,9 +25,9 @@ and lets the user explicitly send editor selections to the agent.
   with the command prefilled, e.g. `/login`, `/update`, `/permissions`). Prefix
   a prompt with `//` when it must begin with a literal `/`.
 - The sidebar chat renders streaming text, collapsible reasoning, tool-call
-  rows, and token usage. Its Agent status panel mirrors live Todo updates with
-  per-item and aggregate confidence, session KV-cache hit rate, and the latest
-  observed context occupancy. State is retained per session and context-window
+  rows, and token usage. Compact composer icons mirror Todo, confidence,
+  session KV-cache, and context status; clicking an icon opens the detailed
+  Todo and metrics popover. State is retained per session and context-window
   inference follows Jcode's model-family defaults (overridable with
   `jcode.contextWindowTokens`). Permission requests are surfaced when the bridge
   advertises the `permissions` capability.

@@ -302,7 +302,8 @@ async function run() {
 
   const webviewSource = fsSync.readFileSync(path.join(__dirname, "../../extension.js"), "utf8");
   assert.match(webviewSource, /<button id="model"/, "the model catalog must use a visible VS Code picker button");
-  assert.match(webviewSource, /id="runtime-panel"/, "the sidebar must include the runtime metrics and todo panel");
+  assert.match(webviewSource, /id="runtime-indicators"/, "runtime status must use compact composer icons");
+  assert.match(webviewSource, /id="runtime-popover"/, "runtime details must be hidden in an on-demand popover");
   assert.match(webviewSource, /QuickPickItemKind\.Separator/, "the model picker must group models by provider");
   const pickerItems = await vscode.commands.executeCommand(
     "jcode._test.getModelPickerItems",

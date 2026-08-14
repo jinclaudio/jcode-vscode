@@ -51,7 +51,7 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.8.0";
+const CLIENT_NAME = "jcode-vscode/0.8.1";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -1997,6 +1997,8 @@ function formatRange(selection) {
 function getChatHtml(webview, context) {
   const nonce = getNonce();
   const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "media", "style.css"));
+  const markedUri = webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "media", "vendor", "marked.umd.js"));
+  const purifyUri = webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "media", "vendor", "purify.min.js"));
   const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, "media", "chat.js"));
   return `<!DOCTYPE html>
 <html lang="en">
@@ -2030,7 +2032,7 @@ function getChatHtml(webview, context) {
     </section>
     <footer class="composer-zone">
       <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash commands"></div>
-      <section id="runtime-panel" class="runtime-panel" aria-label="Jcode agent status" hidden>
+      <section id="runtime-popover" class="runtime-popover" aria-label="Jcode agent status details" hidden>
         <div class="runtime-heading"><span>Agent status</span><span id="todo-summary" class="runtime-summary"></span></div>
         <div class="runtime-metrics">
           <div class="runtime-metric" title="Aggregate todo confidence"><div class="metric-label"><span>Confidence</span><strong id="confidence-value">—</strong></div><div class="metric-track"><i id="confidence-bar"></i></div></div>
@@ -2047,6 +2049,12 @@ function getChatHtml(webview, context) {
           <div class="tool-left">
             <button id="attach" class="small-btn" type="button" title="Attach files or images"><svg viewBox="0 0 24 24"><path d="M12 17V7a4 4 0 0 1 8 0v9a7 7 0 0 1-14 0V6a2 2 0 0 1 4 0v10a3 3 0 0 0 6 0V8"/></svg><span>Attach</span></button>
             <button id="selection-toggle" class="small-btn active" type="button" title="Include current editor selection"><svg viewBox="0 0 24 24"><path d="M8 5H5v3M16 5h3v3M8 19H5v-3M16 19h3v-3M9 9h6v6H9z"/></svg><span>Selection</span></button>
+            <div id="runtime-indicators" class="runtime-indicators" hidden>
+              <button id="todo-indicator" class="runtime-indicator" type="button" aria-label="Show todos" title="Todos"><svg viewBox="0 0 16 16"><path d="M2.5 4.5 4 6l2.5-3M8 4.5h5M2.5 10 4 11.5l2.5-3M8 10h5"/></svg><span id="todo-count" class="indicator-badge"></span></button>
+              <button id="confidence-indicator" class="runtime-indicator" type="button" aria-label="Show confidence" title="Confidence"><svg viewBox="0 0 16 16"><path d="m8 1.8 4.8 3.1v4.3c0 2.3-1.9 4-4.8 5-2.9-1-4.8-2.7-4.8-5V4.9L8 1.8Z"/><path d="m5.7 8 1.5 1.5 3.1-3.2"/></svg></button>
+              <button id="cache-indicator" class="runtime-indicator" type="button" aria-label="Show KV cache rate" title="KV cache"><svg viewBox="0 0 16 16"><ellipse cx="8" cy="3.5" rx="4.8" ry="2"/><path d="M3.2 3.5v4c0 1.1 2.1 2 4.8 2s4.8-.9 4.8-2v-4M3.2 7.5v4c0 1.1 2.1 2 4.8 2s4.8-.9 4.8-2v-4"/></svg></button>
+              <button id="context-indicator" class="runtime-indicator" type="button" aria-label="Show context usage" title="Context"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 2.5V8l3.8 2.2"/></svg></button>
+            </div>
           </div>
           <div class="tool-right">
             <button id="model" class="model-picker-button" type="button" aria-label="Select model" aria-haspopup="listbox" title="Select model"><span id="model-label">auto</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></button>
@@ -2059,6 +2067,8 @@ function getChatHtml(webview, context) {
       <div class="composer-hint">Enter to send · Shift+Enter for a new line · paste images directly</div>
     </footer>
   </main>
+  <script nonce="${nonce}" src="${markedUri}"></script>
+  <script nonce="${nonce}" src="${purifyUri}"></script>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;

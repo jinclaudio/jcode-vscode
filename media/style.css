@@ -219,14 +219,44 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 
 /* Composer */
 .composer-zone { position: relative; padding: 0 8px 9px; background: linear-gradient(transparent, var(--vscode-sideBar-background) 14px); }
-.runtime-panel {
-  max-height: min(230px, 38vh);
-  margin: 0 4px 7px;
+.runtime-popover {
+  position: absolute;
+  left: 12px; right: 12px;
+  bottom: calc(100% - 3px);
+  z-index: 12;
+  max-height: min(260px, 44vh);
   overflow: auto;
   border: 1px solid var(--vscode-widget-border);
   border-radius: 8px;
   background: var(--vscode-editorWidget-background);
   box-shadow: 0 3px 12px rgba(0, 0, 0, 0.10);
+}
+.runtime-indicators { display: inline-flex; align-items: center; gap: 1px; flex: 0 0 auto; }
+.runtime-indicators[hidden], .runtime-popover[hidden] { display: none !important; }
+.runtime-indicator {
+  position: relative;
+  display: grid; place-items: center;
+  flex: 0 0 24px;
+  width: 24px; height: 24px;
+  padding: 0;
+  border: 0; border-radius: 5px;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  cursor: pointer;
+}
+.runtime-indicator:hover, .runtime-indicator[aria-expanded="true"] { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
+.runtime-indicator svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
+.runtime-indicator[data-tone="good"] { color: var(--vscode-testing-iconPassed, #73c991); }
+.runtime-indicator[data-tone="warn"] { color: var(--vscode-editorWarning-foreground, #cca700); }
+.runtime-indicator[data-tone="low"] { color: var(--vscode-testing-iconFailed, #f14c4c); }
+.indicator-badge {
+  position: absolute; right: 0; bottom: 0;
+  min-width: 11px; height: 11px;
+  padding: 0 2px;
+  border-radius: 6px;
+  color: var(--vscode-badge-foreground);
+  background: var(--vscode-badge-background);
+  font-size: 7px; line-height: 11px; text-align: center;
 }
 .runtime-heading {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -453,7 +483,7 @@ body.running #cancel { display: grid; }
     width: 100%;
     gap: 3px;
   }
-  .model-input {
+  .model-picker-button {
     width: 100%;
     max-width: none;
   }

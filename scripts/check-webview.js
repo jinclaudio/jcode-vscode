@@ -73,7 +73,7 @@ if (!html.includes('<button id="model"') || !html.includes('id="model-label"')) 
   console.error('FAIL: generated HTML must include the VS Code model picker button');
   process.exit(1);
 }
-for (const id of ["runtime-panel", "todo-list", "confidence-value", "cache-value", "context-value"]) {
+for (const id of ["runtime-popover", "runtime-indicators", "todo-indicator", "confidence-indicator", "cache-indicator", "context-indicator", "todo-list"]) {
   if (!html.includes(`id="${id}"`)) {
     console.error(`FAIL: generated HTML must include runtime dashboard element #${id}`);
     process.exit(1);

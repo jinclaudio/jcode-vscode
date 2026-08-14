@@ -23,7 +23,13 @@
   var modelLabel = document.getElementById("model-label");
   var effortSelect = document.getElementById("effort");
   var sessionStatus = document.getElementById("session-status");
-  var runtimePanel = document.getElementById("runtime-panel");
+  var runtimePopover = document.getElementById("runtime-popover");
+  var runtimeIndicators = document.getElementById("runtime-indicators");
+  var todoIndicator = document.getElementById("todo-indicator");
+  var confidenceIndicator = document.getElementById("confidence-indicator");
+  var cacheIndicator = document.getElementById("cache-indicator");
+  var contextIndicator = document.getElementById("context-indicator");
+  var todoCount = document.getElementById("todo-count");
   var todoSummary = document.getElementById("todo-summary");
   var todoList = document.getElementById("todo-list");
 
@@ -42,11 +48,36 @@
   var selectedModel = "";
   var availableModels = [];
 
+  if (window.marked && typeof window.marked.setOptions === "function") {
+    window.marked.setOptions({ gfm: true, breaks: true });
+  }
+
+  function renderMarkdown(element, text) {
+    var source = String(text || "");
+    if (!window.marked || !window.DOMPurify) {
+      element.textContent = source;
+      return;
+    }
+    try {
+      var rendered = window.marked.parse(source, { gfm: true, breaks: true });
+      element.innerHTML = window.DOMPurify.sanitize(rendered, {
+        FORBID_TAGS: ["script", "style", "iframe", "object", "embed", "form", "input", "button", "textarea", "select", "img"],
+        FORBID_ATTR: ["style", "srcdoc"],
+      });
+      element.querySelectorAll("a[href]").forEach(function (link) {
+        link.setAttribute("rel", "noopener noreferrer");
+        link.setAttribute("target", "_blank");
+      });
+    } catch (error) {
+      element.textContent = source;
+    }
+  }
+
   function persist() {
     var items = Array.prototype.map.call(messages.querySelectorAll(".chat[data-role]"), function (item) {
       return {
         role: item.dataset.role,
-        text: item.querySelector(".chat-bubble").textContent,
+        text: item.__rawText != null ? item.__rawText : item.querySelector(".chat-bubble").textContent,
         meta: item.querySelector(".chat-footer") ? item.querySelector(".chat-footer").textContent : "",
         attachments: JSON.parse(item.dataset.attachments || "[]"),
       };
@@ -91,6 +122,7 @@
     item.className = "chat " + (role === "user" ? "chat-user" : "chat-assistant");
     item.dataset.role = role;
     item.dataset.attachments = JSON.stringify(files || []);
+    item.__rawText = String(text || "");
     var header = document.createElement("div");
     header.className = "chat-header";
     var avatar = document.createElement("span");
@@ -101,7 +133,7 @@
     header.append(avatar, label);
     var bubble = document.createElement("div");
     bubble.className = "chat-bubble";
-    bubble.textContent = text;
+    renderMarkdown(bubble, item.__rawText);
     item.append(header);
     var fileWrap = createMessageAttachments(files);
     if (fileWrap) {
@@ -130,6 +162,7 @@
     item.className = "chat chat-assistant";
     item.dataset.role = "assistant";
     item.dataset.attachments = "[]";
+    item.__rawText = "";
     var header = document.createElement("div");
     header.className = "chat-header";
     header.innerHTML = '<span class="avatar">J</span><span>Jcode</span>';
@@ -313,19 +346,32 @@
     state = state || {};
     var todos = Array.isArray(state.todos) ? state.todos : [];
     var hasUsage = Number(state.effectiveInputTokens) > 0 || Number(state.contextTokens) > 0;
-    runtimePanel.hidden = todos.length === 0 && !hasUsage;
+    var hasData = todos.length > 0 || hasUsage;
+    runtimeIndicators.hidden = !hasData;
+    if (!hasData) runtimePopover.hidden = true;
 
     var completed = todos.filter(function (todo) { return todo.status === "completed"; }).length;
     todoSummary.textContent = todos.length ? completed + "/" + todos.length + " done" : "";
+    todoIndicator.hidden = todos.length === 0;
+    todoCount.textContent = todos.length ? String(todos.length) : "";
+    todoIndicator.title = todos.length ? "Todos: " + completed + "/" + todos.length + " completed" : "Todos";
 
     var confidence = state.aggregateConfidence || "unknown";
     var confidenceIndex = ["speculative", "plausible", "validated", "verified"].indexOf(confidence);
     setMetric("confidence-value", "confidence-bar", confidence === "unknown" ? "—" : confidence, (confidenceIndex + 1) / 4, confidence);
+    confidenceIndicator.hidden = confidence === "unknown";
+    confidenceIndicator.dataset.confidence = confidence;
+    confidenceIndicator.title = confidence === "unknown" ? "Confidence unavailable" : "Confidence: " + confidence;
 
     var effectiveInput = Math.max(0, Number(state.effectiveInputTokens) || 0);
     var cacheRead = Math.max(0, Number(state.cacheReadTokens) || 0);
     var cacheRatio = effectiveInput > 0 ? cacheRead / effectiveInput : 0;
     setMetric("cache-value", "cache-bar", effectiveInput > 0 ? Math.round(Math.min(1, cacheRatio) * 100) + "%" : "—", cacheRatio);
+    cacheIndicator.hidden = !hasUsage;
+    cacheIndicator.dataset.tone = cacheRatio >= 0.7 ? "good" : cacheRatio >= 0.35 ? "warn" : "low";
+    cacheIndicator.title = effectiveInput > 0
+      ? "KV cache: " + Math.round(Math.min(1, cacheRatio) * 100) + "% (" + formatTokens(cacheRead) + "/" + formatTokens(effectiveInput) + ")"
+      : "KV cache unavailable";
 
     var contextTokens = Math.max(0, Number(state.contextTokens) || 0);
     var contextLimit = Math.max(1, Number(state.contextLimit) || 200000);
@@ -335,6 +381,12 @@
       contextTokens > 0 ? formatTokens(contextTokens) + "/" + formatTokens(contextLimit) : "—",
       contextTokens / contextLimit
     );
+    var contextRatio = contextTokens / contextLimit;
+    contextIndicator.hidden = !hasUsage;
+    contextIndicator.dataset.tone = contextRatio >= 0.8 ? "low" : contextRatio >= 0.5 ? "warn" : "good";
+    contextIndicator.title = contextTokens > 0
+      ? "Context: " + formatTokens(contextTokens) + "/" + formatTokens(contextLimit) + " (" + Math.round(Math.min(1, contextRatio) * 100) + "%)"
+      : "Context unavailable";
 
     todoList.replaceChildren();
     var previousGroup;
@@ -615,10 +667,37 @@
   modelButton.addEventListener("click", function () {
     vscode.postMessage({ type: "chooseModel" });
   });
+  Array.prototype.forEach.call(document.querySelectorAll(".runtime-indicator"), function (button) {
+    button.setAttribute("aria-expanded", "false");
+    button.addEventListener("click", function (event) {
+      event.stopPropagation();
+      runtimePopover.hidden = !runtimePopover.hidden;
+      var expanded = runtimePopover.hidden ? "false" : "true";
+      document.querySelectorAll(".runtime-indicator").forEach(function (indicator) {
+        indicator.setAttribute("aria-expanded", expanded);
+      });
+    });
+  });
+  document.addEventListener("click", function (event) {
+    if (!runtimePopover.hidden && !runtimePopover.contains(event.target) && !runtimeIndicators.contains(event.target)) {
+      runtimePopover.hidden = true;
+      document.querySelectorAll(".runtime-indicator").forEach(function (indicator) {
+        indicator.setAttribute("aria-expanded", "false");
+      });
+    }
+  });
   effortSelect.addEventListener("change", function () {
     vscode.postMessage({ type: "effort", effort: effortSelect.value });
   });
   window.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && !runtimePopover.hidden) {
+      event.preventDefault();
+      runtimePopover.hidden = true;
+      document.querySelectorAll(".runtime-indicator").forEach(function (indicator) {
+        indicator.setAttribute("aria-expanded", "false");
+      });
+      return;
+    }
     if (event.key === "Escape" && document.body.classList.contains("running")) {
       event.preventDefault();
       vscode.postMessage({ type: "cancel" });
@@ -698,7 +777,8 @@
           liveBubble = createLiveBubble();
           liveBubble.item.dataset.turn = String(data.turnId || "");
         }
-        liveBubble.bubble.textContent += data.text;
+        liveBubble.item.__rawText += data.text;
+        renderMarkdown(liveBubble.bubble, liveBubble.item.__rawText);
         messages.scrollTop = messages.scrollHeight;
         break;
       case "reasoning":
@@ -736,7 +816,8 @@
           break;
         }
         if (liveBubble) {
-          liveBubble.bubble.textContent = data.text;
+          liveBubble.item.__rawText = String(data.text || "");
+          renderMarkdown(liveBubble.bubble, liveBubble.item.__rawText);
           liveBubble.footer.textContent = [data.provider, data.model].filter(Boolean).join(" · ");
           liveBubble = undefined;
           persist();
