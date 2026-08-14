@@ -274,16 +274,26 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
   line-height: 1.45;
 }
 .prompt::placeholder { color: var(--vscode-input-placeholderForeground); opacity: 1; }
-.composer-tools { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 5px 6px 6px; }
+.composer-tools {
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px 6px;
+}
 .tool-left, .tool-right { display: flex; align-items: center; gap: 3px; min-width: 0; }
+.tool-left { overflow: hidden; }
+.tool-right { justify-content: flex-end; }
 .small-btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+  flex: 0 0 auto;
   height: 26px;
   padding: 0 7px;
   border: 0; border-radius: 6px;
   color: var(--vscode-descriptionForeground);
   background: transparent;
   font-size: 10px;
+  white-space: nowrap;
   cursor: pointer;
 }
 .small-btn:hover, .small-btn.active { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
@@ -296,15 +306,16 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-
   background: transparent;
   font-size: 10px;
 }
-.model-input { width: min(128px, 34vw); padding: 0 7px; }
+.model-input { width: min(128px, 34vw); min-width: 0; padding: 0 7px; }
 .model-input:hover, .model-input:focus, .effort-select:hover, .effort-select:focus {
   color: var(--vscode-foreground);
   background: var(--vscode-toolbar-hoverBackground);
   outline: 0;
 }
-.effort-select { max-width: 82px; padding: 0 3px; }
+.effort-select { min-width: 0; max-width: 82px; padding: 0 3px; }
 .send-btn {
   display: grid; place-items: center;
+  flex: 0 0 27px;
   width: 27px; height: 27px;
   padding: 0;
   border: 0; border-radius: 7px;
@@ -353,9 +364,40 @@ body.running #cancel { display: grid; }
 .slash-item .tier { justify-self: end; font-size: 9px; text-transform: uppercase; opacity: 0.7; }
 .composer-hint { margin: 5px 4px 0; color: var(--vscode-descriptionForeground); font-size: 9px; text-align: center; }
 
+/*
+ * Sidebar widths vary with the Activity Bar and auxiliary panels. At narrow
+ * widths the two control groups cannot safely share one row. Put model,
+ * effort, and send on a dedicated second row instead of allowing flex items
+ * and native <select> controls to paint over one another.
+ */
+@media (max-width: 620px) {
+  .composer-tools {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+  .tool-left {
+    justify-content: flex-start;
+    overflow: visible;
+  }
+  .tool-right {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(58px, auto) 27px;
+    width: 100%;
+    gap: 3px;
+  }
+  .model-input {
+    width: 100%;
+    max-width: none;
+  }
+  .effort-select {
+    width: 100%;
+    max-width: 86px;
+  }
+}
+
 @media (max-width: 300px) {
-  .model-input { width: 80px; }
   .small-btn span { display: none; }
+  .tool-right { grid-template-columns: minmax(0, 1fr) minmax(52px, 68px) 27px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
