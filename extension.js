@@ -52,7 +52,7 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.9.1";
+const CLIENT_NAME = "jcode-vscode/0.9.2";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -1760,6 +1760,7 @@ class JcodeChatProvider {
     let provider;
     let model;
     const toolInputs = new Map();
+    let activeToolInputId;
     try {
       const runtime = await client.getRuntimeInfo(sessionId);
       provider = runtime.provider;
@@ -1785,17 +1786,24 @@ class JcodeChatProvider {
             this.post({ type: "reasoning", text: event.text, turnId, sessionId });
             break;
           case "tool_start":
-            toolInputs.set(event.call_id, { name: event.name, input: "", captured: false });
+            activeToolInputId = event.call_id || activeToolInputId;
+            toolInputs.set(activeToolInputId, { name: event.name, input: "", captured: false });
             this.post({ type: "tool", kind: "start", name: event.name, detail: "", turnId });
             break;
           case "tool_input_delta": {
-            const call = toolInputs.get(event.call_id) || { name: "", input: "", captured: false };
+            // The v1 harness bridge currently emits tool_input with an empty
+            // call_id even though start/exec/done carry the real id. Associate
+            // anonymous input chunks with the most recently started tool.
+            const callId = event.call_id || activeToolInputId;
+            if (!callId) break;
+            const call = toolInputs.get(callId) || { name: "", input: "", captured: false };
             call.input += event.delta || "";
-            toolInputs.set(event.call_id, call);
+            toolInputs.set(callId, call);
             break;
           }
           case "tool_exec": {
-            const call = toolInputs.get(event.call_id);
+            const callId = event.call_id || activeToolInputId;
+            const call = toolInputs.get(callId);
             if (call && isTodoToolName(event.name || call.name) && !call.captured) {
               try {
                 this.updateRuntimeTodos(JSON.parse(call.input));
@@ -1808,7 +1816,8 @@ class JcodeChatProvider {
           }
           case "tool_done":
             {
-              const call = toolInputs.get(event.call_id);
+              const callId = event.call_id || activeToolInputId;
+              const call = toolInputs.get(callId);
               if (call && isTodoToolName(event.name || call.name) && !call.captured) {
                 try {
                   this.updateRuntimeTodos(JSON.parse(call.input));
@@ -1816,7 +1825,8 @@ class JcodeChatProvider {
                   // Invalid or unavailable tool input cannot update the dashboard.
                 }
               }
-              toolInputs.delete(event.call_id);
+              toolInputs.delete(callId);
+              if (activeToolInputId === callId) activeToolInputId = undefined;
             }
             this.post({ type: "tool", kind: "done", name: event.name, detail: event.output ? String(event.output).slice(0, 500) : "", error: Boolean(event.error), turnId });
             break;

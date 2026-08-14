@@ -60,8 +60,10 @@ def send_message(conn, frame):
             {"id": "tested", "content": "Validate metric calculations", "status": "completed", "priority": "low", "group": "metrics", "confidence": "validated", "completion_confidence": "verified"}
         ]})
         emit(conn, {"v": 1, "ev": "tool_start", "session_id": sid, "call_id": "todo-1", "name": "todo"})
-        emit(conn, {"v": 1, "ev": "tool_input_delta", "session_id": sid, "call_id": "todo-1", "delta": todo_input[:len(todo_input)//2]})
-        emit(conn, {"v": 1, "ev": "tool_input_delta", "session_id": sid, "call_id": "todo-1", "delta": todo_input[len(todo_input)//2:]})
+        # Match the current production bridge: tool_input has no call id even
+        # though start/exec/done use the real id.
+        emit(conn, {"v": 1, "ev": "tool_input_delta", "session_id": sid, "call_id": "", "delta": todo_input[:len(todo_input)//2]})
+        emit(conn, {"v": 1, "ev": "tool_input_delta", "session_id": sid, "call_id": "", "delta": todo_input[len(todo_input)//2:]})
         emit(conn, {"v": 1, "ev": "tool_exec", "session_id": sid, "call_id": "todo-1", "name": "todo"})
         emit(conn, {"v": 1, "ev": "tool_done", "session_id": sid, "call_id": "todo-1", "name": "todo", "output": "ok"})
         emit(conn, {"v": 1, "ev": "token_usage", "session_id": sid, "input": 250, "output": 100, "cache_read_input": 750})
