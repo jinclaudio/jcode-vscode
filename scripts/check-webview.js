@@ -103,6 +103,23 @@ for (const id of ["runtime-popover", "runtime-indicators", "todo-indicator", "co
     process.exit(1);
   }
 }
+for (const panel of ["todo", "confidence", "cache", "context"]) {
+  if (!html.includes(`data-runtime-panel="${panel}"`) || !html.includes(`data-runtime-content="${panel}"`)) {
+    console.error(`FAIL: runtime icon ${panel} must have its own matching popover content`);
+    process.exit(1);
+  }
+}
+for (const required of ["showRuntimePanel", "content.hidden = content.dataset.runtimeContent !== panel", "client.softInterrupt", 'case "steering"']) {
+  const source = required === "client.softInterrupt" ? extensionSource : chatSource;
+  if (!source.includes(required)) {
+    console.error(`FAIL: missing runtime interaction path ${required}`);
+    process.exit(1);
+  }
+}
+if (/RUNTIME_DEMO|webviewRuntimeState/.test(extensionSource)) {
+  console.error("FAIL: production runtime state must not be replaced with demo metrics");
+  process.exit(1);
+}
 const markedScriptIndex = html.indexOf("/media/vendor/marked.umd.js");
 const purifyScriptIndex = html.indexOf("/media/vendor/purify.min.js");
 const chatScriptIndex = html.indexOf("/media/chat.js");

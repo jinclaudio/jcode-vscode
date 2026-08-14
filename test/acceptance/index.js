@@ -106,6 +106,8 @@ def handle(conn, frame):
         reply("ok")
     elif req == "send_message":
         send_message(conn, frame)
+    elif req == "soft_interrupt":
+        reply("ok")
     elif req == "cancel":
         reply("ok")
         sid = frame.get("session_id")
@@ -304,6 +306,8 @@ async function run() {
   assert.match(webviewSource, /<button id="model"/, "the model catalog must use a visible VS Code picker button");
   assert.match(webviewSource, /id="runtime-indicators"/, "runtime status must use compact composer icons");
   assert.match(webviewSource, /id="runtime-popover"/, "runtime details must be hidden in an on-demand popover");
+  assert.match(webviewSource, /data-runtime-panel="todo"/, "each runtime icon must select its own popover panel");
+  assert.doesNotMatch(webviewSource, /RUNTIME_DEMO|webviewRuntimeState/, "runtime metrics must come from live Jcode events, not demo data");
   assert.match(webviewSource, /QuickPickItemKind\.Separator/, "the model picker must group models by provider");
   const pickerItems = await vscode.commands.executeCommand(
     "jcode._test.getModelPickerItems",
@@ -592,16 +596,22 @@ async function run() {
     return current.some((frame) => frame.req === "send_message" && frame.content.startsWith("WAIT_FOR_CANCEL"));
   }, "cancellable message to be sent");
   const sendCountDuringTurn = (await readBridgeFrames(bridgeLog)).filter((frame) => frame.req === "send_message").length;
-  const rejectedConcurrent = await vscode.commands.executeCommand(
+  const steering = await vscode.commands.executeCommand(
     "jcode._test.sendChat",
-    "This concurrent send must be rejected.",
+    "STEER_CURRENT_RESPONSE",
     false,
   );
-  assert.equal(rejectedConcurrent, undefined);
+  assert.equal(steering.steering, true);
   assert.equal(
     (await readBridgeFrames(bridgeLog)).filter((frame) => frame.req === "send_message").length,
     sendCountDuringTurn,
-    "a second send must not reach the daemon while a turn is active",
+    "steering must not start a second model turn",
+  );
+  assert.ok(
+    (await readBridgeFrames(bridgeLog)).some(
+      (frame) => frame.req === "soft_interrupt" && frame.content === "STEER_CURRENT_RESPONSE" && frame.urgent === false,
+    ),
+    "a message sent during generation must use the SDK softInterrupt operation",
   );
   await vscode.commands.executeCommand("jcode._test.sendChat", "/cancel", false);
   assert.equal(

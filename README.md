@@ -27,15 +27,18 @@ and lets the user explicitly send editor selections to the agent.
 - The sidebar chat renders streaming text, collapsible reasoning, tool-call
   rows, token usage, and sanitized GitHub-flavored Markdown including headings,
   lists, links, blockquotes, tables, inline code, and fenced code blocks. Compact
-  composer icons mirror Todo, confidence,
-  session KV-cache, and context status; clicking an icon opens the detailed
-  Todo and metrics popover. State is retained per session and context-window
+  composer icons mirror Todo, confidence, session KV-cache, and context status;
+  clicking an icon opens only that icon's corresponding compact detail panel.
+  State is retained per session and context-window
   inference follows Jcode's model-family defaults (overridable with
   `jcode.contextWindowTokens`). Permission requests are surfaced when the bridge
   advertises the `permissions` capability.
 - With `jcode.shareEditorContext` (default on), each message includes a compact
   summary of the active editor, selection, open files, dirty files, and
   workspace root, so the agent knows what you are looking at in VS Code.
+- While Jcode is generating, the composer remains editable and the send button
+  submits steering through the SDK's `softInterrupt` operation without starting
+  a second turn. The separate stop button still cancels the active response.
 - `Jcode: Run Connection Diagnostics` (or `/diagnose` in the output channel)
   prints executable, socket, protocol, provider, and session information.
 - The webview UI lives in `media/` (external `chat.js` / `style.css`, loaded via

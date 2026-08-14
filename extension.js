@@ -743,37 +743,6 @@ function emptyRuntimeState(model, configuredLimit) {
   };
 }
 
-// DEMO (temporary): preview data for the runtime dashboard. Only affects
-// webview-bound messages, never the persisted runtime state. Remove this block
-// (and the webviewRuntimeState() call sites) once the UI has been reviewed.
-const RUNTIME_DEMO = true;
-const RUNTIME_DEMO_TODOS = [
-  { id: "t1", content: "Scan the workspace and map the module structure", status: "completed", priority: "high", group: "Investigate", confidence: "verified", completion_confidence: "verified" },
-  { id: "t2", content: "Locate the webview HTML template in extension.js", status: "completed", priority: "high", group: "Investigate", confidence: "validated", completion_confidence: "validated" },
-  { id: "t3", content: "Trace the runtimeState message flow from extension to chat.js", status: "in_progress", priority: "medium", group: "Investigate", confidence: "plausible" },
-  { id: "t4", content: "Reset the VS Code default 20px webview body padding", status: "completed", priority: "high", group: "Fix", confidence: "verified", completion_confidence: "verified" },
-  { id: "t5", content: "Preview the todo dashboard UI in the sidebar", status: "in_progress", priority: "high", group: "Fix", confidence: "speculative" },
-  { id: "t6", content: "Align the runtime panel inset with the composer box", status: "pending", priority: "low", group: "Polish", confidence: "plausible" },
-  { id: "t7", content: "Write an acceptance test for the runtime dashboard", status: "cancelled", priority: "low", group: "Polish", confidence: "speculative" },
-];
-
-function webviewRuntimeState(base) {
-  if (!RUNTIME_DEMO) return base;
-  return {
-    ...base,
-    todos: RUNTIME_DEMO_TODOS,
-    goals: [],
-    aggregateConfidence: aggregateTodoConfidence(RUNTIME_DEMO_TODOS),
-    inputTokens: 51200,
-    outputTokens: 18400,
-    cacheReadTokens: 112000,
-    effectiveInputTokens: 158000,
-    contextTokens: 158000,
-    contextLimit: 200000,
-    activeModel: base.activeModel || "jcode-demo",
-  };
-}
-
 class JcodeChatProvider {
   /** @param {vscode.ExtensionContext} context */
   constructor(context) {
@@ -1021,7 +990,7 @@ class JcodeChatProvider {
       effort: this.getSelectedEffort(),
       slashCommands: SLASH_COMMANDS.filter((command) => !command.hidden),
       attachments: [...this.attachments.values()].map(publicAttachment),
-      runtimeState: webviewRuntimeState(this.runtimeState),
+      runtimeState: this.runtimeState,
     });
   }
 
@@ -1213,7 +1182,7 @@ class JcodeChatProvider {
       effort: this.getSelectedEffort(),
       slashCommands: SLASH_COMMANDS.filter((command) => !command.hidden),
       attachments: [...this.attachments.values()].map(publicAttachment),
-      runtimeState: webviewRuntimeState(this.runtimeState),
+      runtimeState: this.runtimeState,
       error,
     });
   }
@@ -1334,9 +1303,7 @@ class JcodeChatProvider {
     } else if (instruction.startsWith("/")) {
       const commandName = instruction.split(/\s+/, 1)[0];
       if (this.running && commandName !== "/cancel") {
-        void vscode.window.showInformationMessage("Jcode is already responding. Use /cancel before another command.");
-        this.post({ type: "sendRejected", text: instruction });
-        return undefined;
+        return this.steerMessage(instruction);
       }
       if (await this.executeSlashCommand(instruction)) {
         this.post({ type: "sendHandled" });
@@ -1351,9 +1318,7 @@ class JcodeChatProvider {
     }
 
     if (this.running) {
-      void vscode.window.showInformationMessage("Jcode is already responding. Cancel it before sending another message.");
-      this.post({ type: "sendRejected", text: instruction });
-      return undefined;
+      return this.steerMessage(instruction);
     }
 
     const turnId = this.nextTurnId++;
@@ -1440,6 +1405,27 @@ class JcodeChatProvider {
         this.activeTurnId = undefined;
         this.post({ type: "running", running: false, turnId });
       }
+    }
+  }
+
+  async steerMessage(text) {
+    const instruction = typeof text === "string" ? text.trim() : "";
+    if (!instruction || !this.running || !this.sessionId) {
+      this.post({ type: "sendRejected", text: instruction });
+      return undefined;
+    }
+    try {
+      const client = await this.ensureSession();
+      await client.softInterrupt(this.sessionId, instruction, false);
+      this.post({ type: "steering", text: instruction, turnId: this.activeTurnId });
+      this.post({ type: "sendAccepted", turnId: this.activeTurnId, steering: true });
+      return { steering: true, session_id: this.sessionId };
+    } catch (error) {
+      const message = errorMessage(error);
+      log(`chat steering failed: ${message}`);
+      this.post({ type: "error", text: `Could not steer the current response: ${message}` });
+      this.post({ type: "sendRejected", text: instruction, turnId: this.activeTurnId });
+      return undefined;
     }
   }
 

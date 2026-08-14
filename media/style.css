@@ -277,6 +277,15 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   background: var(--vscode-editorWidget-background);
   box-shadow: 0 3px 12px rgba(0, 0, 0, 0.10);
 }
+.runtime-popover[data-panel="confidence"],
+.runtime-popover[data-panel="cache"],
+.runtime-popover[data-panel="context"] {
+  right: auto;
+  width: min(220px, calc(100% - 24px));
+}
+.runtime-popover[data-panel="todo"] { width: auto; }
+.runtime-popover[data-panel="todo"] .runtime-metrics { display: none; }
+.runtime-popover:not([data-panel="todo"]) .todo-list { display: none; }
 .runtime-indicators { display: inline-flex; align-items: center; gap: 1px; flex: 0 0 auto; }
 .runtime-indicators[hidden], .runtime-popover[hidden] { display: none !important; }
 .runtime-indicator {
@@ -312,7 +321,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 }
 .runtime-summary { color: var(--vscode-descriptionForeground); font-weight: 400; }
 .runtime-metrics {
-  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px;
+  display: grid; grid-template-columns: 1fr; gap: 5px;
   padding: 0 7px 7px;
 }
 .runtime-metric {
@@ -470,7 +479,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .send-btn:disabled { opacity: 0.45; cursor: default; }
 .send-btn svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 #cancel { display: none; background: var(--vscode-errorForeground); }
-body.running #send { display: none; }
+body.running #send { display: grid; }
 body.running #cancel { display: grid; }
 
 /* Slash menu */

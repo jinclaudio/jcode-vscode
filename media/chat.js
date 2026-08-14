@@ -24,6 +24,7 @@
   var effortSelect = document.getElementById("effort");
   var sessionStatus = document.getElementById("session-status");
   var runtimePopover = document.getElementById("runtime-popover");
+  var runtimeTitle = document.getElementById("runtime-title");
   var runtimeIndicators = document.getElementById("runtime-indicators");
   var todoIndicator = document.getElementById("todo-indicator");
   var confidenceIndicator = document.getElementById("confidence-indicator");
@@ -342,13 +343,44 @@
       : todo.confidence;
   }
 
+  var runtimePanelTitles = {
+    todo: "Todos",
+    confidence: "Confidence",
+    cache: "KV cache",
+    context: "Context",
+  };
+
+  function closeRuntimePopover() {
+    runtimePopover.hidden = true;
+    document.querySelectorAll(".runtime-indicator").forEach(function (indicator) {
+      indicator.setAttribute("aria-expanded", "false");
+    });
+  }
+
+  function showRuntimePanel(panel, button) {
+    if (!runtimePopover.hidden && runtimePopover.dataset.panel === panel) {
+      closeRuntimePopover();
+      return;
+    }
+    runtimePopover.dataset.panel = panel;
+    runtimeTitle.textContent = runtimePanelTitles[panel] || "Agent status";
+    runtimePopover.setAttribute("aria-label", (runtimePanelTitles[panel] || "Agent status") + " details");
+    runtimePopover.querySelectorAll("[data-runtime-content]").forEach(function (content) {
+      content.hidden = content.dataset.runtimeContent !== panel;
+    });
+    runtimePopover.hidden = false;
+    document.querySelectorAll(".runtime-indicator").forEach(function (indicator) {
+      indicator.setAttribute("aria-expanded", indicator === button ? "true" : "false");
+    });
+  }
+
   function renderRuntimeState(state) {
     state = state || {};
     var todos = Array.isArray(state.todos) ? state.todos : [];
     var hasUsage = Number(state.effectiveInputTokens) > 0 || Number(state.contextTokens) > 0;
     var hasData = todos.length > 0 || hasUsage;
     runtimeIndicators.hidden = !hasData;
-    if (!hasData) runtimePopover.hidden = true;
+    if (!hasData) closeRuntimePopover();
 
     var completed = todos.filter(function (todo) { return todo.status === "completed"; }).length;
     todoSummary.textContent = todos.length ? completed + "/" + todos.length + " done" : "";
@@ -387,6 +419,11 @@
     contextIndicator.title = contextTokens > 0
       ? "Context: " + formatTokens(contextTokens) + "/" + formatTokens(contextLimit) + " (" + Math.round(Math.min(1, contextRatio) * 100) + "%)"
       : "Context unavailable";
+
+    if (!runtimePopover.hidden) {
+      var activeIndicator = document.querySelector('.runtime-indicator[data-runtime-panel="' + runtimePopover.dataset.panel + '"]');
+      if (!activeIndicator || activeIndicator.hidden) closeRuntimePopover();
+    }
 
     todoList.replaceChildren();
     var previousGroup;
@@ -452,10 +489,13 @@
 
   function setRunning(running, turnId) {
     document.body.classList.toggle("running", running);
-    prompt.disabled = running;
+    prompt.disabled = false;
+    prompt.placeholder = running ? "Steer Jcode while it works…" : "Ask Jcode… Type / for commands";
     modelButton.disabled = running;
     effortSelect.disabled = running;
     document.getElementById("attach").disabled = running;
+    document.getElementById("send").title = running ? "Steer current response" : "Send message";
+    document.getElementById("send").setAttribute("aria-label", running ? "Steer current response" : "Send message");
     var typing = document.getElementById("typing");
     if (running && !typing) {
       typing = document.createElement("article");
@@ -468,7 +508,7 @@
       typing.remove();
       finalizeLiveBubble();
     }
-    sessionStatus.textContent = running ? "Working…" : "Ready";
+    sessionStatus.textContent = running ? "Working… steering available" : "Ready";
     sessionStatus.classList.remove("error");
   }
 
@@ -539,7 +579,7 @@
 
   function send() {
     var text = prompt.value.trim();
-    if (!text || submitting || document.body.classList.contains("running")) {
+    if (!text || submitting) {
       return;
     }
     if (pendingPastes > 0) {
@@ -671,19 +711,12 @@
     button.setAttribute("aria-expanded", "false");
     button.addEventListener("click", function (event) {
       event.stopPropagation();
-      runtimePopover.hidden = !runtimePopover.hidden;
-      var expanded = runtimePopover.hidden ? "false" : "true";
-      document.querySelectorAll(".runtime-indicator").forEach(function (indicator) {
-        indicator.setAttribute("aria-expanded", expanded);
-      });
+      showRuntimePanel(button.dataset.runtimePanel, button);
     });
   });
   document.addEventListener("click", function (event) {
     if (!runtimePopover.hidden && !runtimePopover.contains(event.target) && !runtimeIndicators.contains(event.target)) {
-      runtimePopover.hidden = true;
-      document.querySelectorAll(".runtime-indicator").forEach(function (indicator) {
-        indicator.setAttribute("aria-expanded", "false");
-      });
+      closeRuntimePopover();
     }
   });
   effortSelect.addEventListener("change", function () {
@@ -692,10 +725,7 @@
   window.addEventListener("keydown", function (event) {
     if (event.key === "Escape" && !runtimePopover.hidden) {
       event.preventDefault();
-      runtimePopover.hidden = true;
-      document.querySelectorAll(".runtime-indicator").forEach(function (indicator) {
-        indicator.setAttribute("aria-expanded", "false");
-      });
+      closeRuntimePopover();
       return;
     }
     if (event.key === "Escape" && document.body.classList.contains("running")) {
@@ -753,6 +783,9 @@
         }
         appendMessage("user", data.text, data.selection || "", data.attachments || []);
         setSelection("");
+        break;
+      case "steering":
+        appendMessage("user", data.text, "Steering", []);
         break;
       case "sendAccepted":
       case "sendHandled":

@@ -20,7 +20,13 @@ const child = spawn("code", [
   "--extensions-dir", extensionsDir,
   `--extensionDevelopmentPath=${root}`,
   `--extensionTestsPath=${path.join(root, "test/acceptance/index.js")}`,
-], { cwd: root, stdio: "inherit", env: { ...process.env, JCODE_VSCODE_ACCEPTANCE_MARKER: marker } });
+], { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, JCODE_VSCODE_ACCEPTANCE_MARKER: marker } });
+
+// Do not let an orphaned VS Code CLI inherit the caller's stdout/stderr file
+// descriptors. On macOS `code --wait` can outlive the extension-test runner;
+// inherited descriptors then keep CI/background tasks open even after PASS.
+child.stdout.on("data", (chunk) => process.stdout.write(chunk));
+child.stderr.on("data", (chunk) => process.stderr.write(chunk));
 
 const started = Date.now();
 let finished = false;
