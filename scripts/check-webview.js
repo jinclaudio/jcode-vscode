@@ -69,8 +69,8 @@ if (found === 0) {
   console.error("FAIL: no inline script blocks found in generated HTML");
   process.exit(1);
 }
-if (!html.includes('<select id="model"')) {
-  console.error('FAIL: generated HTML must include <select id="model">');
+if (!html.includes('<button id="model"') || !html.includes('id="model-label"')) {
+  console.error('FAIL: generated HTML must include the VS Code model picker button');
   process.exit(1);
 }
 

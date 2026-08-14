@@ -227,6 +227,7 @@ async function run() {
     "jcode._test.closeClient",
     "jcode._test.useMockView",
     "jcode._test.getPostedMessages",
+    "jcode._test.getModelPickerItems",
   ]) {
     assert.ok(commands.includes(command), `${command} must be registered`);
   }
@@ -277,7 +278,18 @@ async function run() {
   assert.equal(firstResult.session_id, "fake-session-1");
 
   const webviewSource = fsSync.readFileSync(path.join(__dirname, "../../extension.js"), "utf8");
-  assert.match(webviewSource, /<select id="model"/, "the model catalog must use a visible select control");
+  assert.match(webviewSource, /<button id="model"/, "the model catalog must use a visible VS Code picker button");
+  assert.match(webviewSource, /QuickPickItemKind\.Separator/, "the model picker must group models by provider");
+  const pickerItems = await vscode.commands.executeCommand(
+    "jcode._test.getModelPickerItems",
+    ["gpt-5.5", "claude-opus-4-6", "custom-model"],
+    [{ model: "custom-model", provider: "custom-provider", available: true }],
+    "gpt-5.5",
+  );
+  const separators = pickerItems.filter((item) => item.kind === vscode.QuickPickItemKind.Separator).map((item) => item.label);
+  assert.deepEqual(separators, ["Automatic", "Anthropic", "custom-provider", "OpenAI"]);
+  assert.equal(pickerItems.find((item) => item.model === "gpt-5.5").description, "Current");
+  assert.equal(pickerItems.find((item) => item.model === "custom-model").detail, "custom-provider");
 
   let frames = await readBridgeFrames(bridgeLog);
   const createFrame = frames.find((frame) => frame.req === "create_session");

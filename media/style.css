@@ -299,19 +299,30 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .small-btn:hover, .small-btn.active { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
 .small-btn.active { color: var(--accent); }
 .small-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.model-input, .effort-select {
+.model-picker-button, .effort-select {
   height: 26px;
   border: 0; border-radius: 6px;
   color: var(--vscode-descriptionForeground);
   background: transparent;
   font-size: 10px;
 }
-.model-input { width: min(128px, 34vw); min-width: 0; padding: 0 7px; }
-.model-input:hover, .model-input:focus, .effort-select:hover, .effort-select:focus {
+.model-picker-button {
+  display: inline-flex; align-items: center; gap: 4px;
+  width: min(142px, 38vw); min-width: 0;
+  padding: 0 5px 0 8px;
+  cursor: pointer;
+}
+.model-picker-button span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-picker-button svg {
+  flex: 0 0 auto; width: 12px; height: 12px;
+  fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+}
+.model-picker-button:hover, .model-picker-button:focus-visible, .effort-select:hover, .effort-select:focus {
   color: var(--vscode-foreground);
   background: var(--vscode-toolbar-hoverBackground);
   outline: 0;
 }
+.model-picker-button:disabled { opacity: 0.45; cursor: default; }
 .effort-select { min-width: 0; max-width: 82px; padding: 0 3px; }
 .send-btn {
   display: grid; place-items: center;

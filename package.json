@@ -2,7 +2,7 @@
   "name": "jcode-vscode",
   "displayName": "Jcode",
   "description": "Full Jcode agent wrapper: sidebar chat, editor context, session management, and slash commands over the official jcode SDK (api-bridge).",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "publisher": "jcode",
   "license": "MIT",
   "repository": {

@@ -50,7 +50,7 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.6.2";
+const CLIENT_NAME = "jcode-vscode/0.7.0";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -505,6 +505,15 @@ function activate(context) {
         await chatProvider.postChain;
         return chatProvider.testPostedMessages || [];
       }),
+      vscode.commands.registerCommand("jcode._test.getModelPickerItems", (models, routes, current) =>
+        buildModelQuickPickItems(models, routes, current).map((item) => ({
+          label: item.label,
+          kind: item.kind,
+          model: item.model,
+          description: item.description,
+          detail: item.detail,
+        })),
+      ),
     );
   }
 }
@@ -534,6 +543,82 @@ async function runDiagnostics(context) {
   }
 }
 
+const MODEL_PROVIDER_PREFIXES = [
+  ["claude", "Anthropic"],
+  ["gpt", "OpenAI"],
+  ["codex", "OpenAI"],
+  ["o1", "OpenAI"],
+  ["o3", "OpenAI"],
+  ["o4", "OpenAI"],
+  ["gemini", "Google"],
+  ["deepseek", "DeepSeek"],
+  ["grok", "xAI"],
+  ["glm", "Zhipu AI"],
+  ["kimi", "Moonshot AI"],
+  ["qwen", "Alibaba Cloud"],
+  ["minimax", "MiniMax"],
+];
+
+function inferredModelProvider(model) {
+  const normalized = String(model || "").toLowerCase();
+  const qualified = normalized.match(/^([^/:]+)[/:]/);
+  if (qualified) {
+    const explicit = qualified[1];
+    const known = MODEL_PROVIDER_PREFIXES.find(([prefix]) => explicit === prefix);
+    return known ? known[1] : explicit.replace(/(^|[-_])\w/g, (part) => part.replace(/[-_]/, "").toUpperCase());
+  }
+  return MODEL_PROVIDER_PREFIXES.find(([prefix]) => normalized.startsWith(prefix))?.[1] || "Other";
+}
+
+function buildModelQuickPickItems(models, routes, current) {
+  const names = Array.from(new Set((models || []).filter(Boolean)));
+  if (current && !names.includes(current)) names.unshift(current);
+
+  const routeProviders = new Map();
+  for (const route of routes || []) {
+    if (!route?.model || !route?.provider || route.available === false) continue;
+    const providers = routeProviders.get(route.model) || new Set();
+    providers.add(route.provider);
+    routeProviders.set(route.model, providers);
+  }
+
+  const groups = new Map();
+  for (const model of names) {
+    const providers = Array.from(routeProviders.get(model) || []);
+    const provider = providers.length === 1
+      ? providers[0]
+      : providers.length > 1
+        ? "Multiple providers"
+        : inferredModelProvider(model);
+    if (!groups.has(provider)) groups.set(provider, []);
+    groups.get(provider).push(model);
+  }
+
+  const items = [
+    { label: "Automatic", kind: vscode.QuickPickItemKind.Separator },
+    {
+      label: "$(sparkle) Auto",
+      description: current ? undefined : "Current",
+      detail: "Let Jcode select the model for each new chat",
+      model: "",
+      picked: !current,
+    },
+  ];
+  for (const provider of Array.from(groups.keys()).sort((a, b) => a.localeCompare(b))) {
+    items.push({ label: provider, kind: vscode.QuickPickItemKind.Separator });
+    for (const model of groups.get(provider).sort((a, b) => a.localeCompare(b))) {
+      items.push({
+        label: model,
+        description: model === current ? "Current" : undefined,
+        detail: provider,
+        model,
+        picked: model === current,
+      });
+    }
+  }
+  return items;
+}
+
 class JcodeChatProvider {
   /** @param {vscode.ExtensionContext} context */
   constructor(context) {
@@ -547,6 +632,7 @@ class JcodeChatProvider {
     this.sessionInitPromise = undefined;
     this.modelWatcher = undefined;
     this.modelWatcherClient = undefined;
+    this.modelCatalog = { models: this.getModelList(), routes: [] };
     this.disposed = false;
     this.nextTurnId = 1;
     this.activeTurnId = undefined;
@@ -604,6 +690,9 @@ class JcodeChatProvider {
         case "model":
           await this.setSelectedModel(message.model);
           break;
+        case "chooseModel":
+          await this.showModelPicker();
+          break;
         case "effort":
           await this.setSelectedEffort(message.effort);
           break;
@@ -651,6 +740,41 @@ class JcodeChatProvider {
       return saved;
     }
     return vscode.workspace.getConfiguration("jcode").get("defaultEffort", "");
+  }
+
+  async showModelPicker() {
+    if (this.running) {
+      this.post({ type: "notice", text: "Cancel the active response before changing models." });
+      return;
+    }
+
+    let models = this.modelCatalog.models;
+    let routes = this.modelCatalog.routes;
+    let current = this.getSelectedModel();
+    try {
+      const client = await this.ensureSession();
+      const [catalog, runtime] = await Promise.all([
+        client.listModels(this.sessionId),
+        client.getRuntimeInfo(this.sessionId).catch(() => undefined),
+      ]);
+      models = catalog.models.length > 0 ? catalog.models : this.getModelList();
+      routes = runtime?.routes || [];
+      current = catalog.current || current;
+      this.modelCatalog = { models, routes };
+    } catch {
+      // Keep the latest catalog so the picker remains useful while reconnecting.
+    }
+
+    const items = buildModelQuickPickItems(models, routes, current);
+    const picked = await vscode.window.showQuickPick(items, {
+      title: "Select Jcode Model",
+      placeHolder: "Search models by name or provider",
+      matchOnDescription: true,
+      matchOnDetail: true,
+    });
+    if (picked && picked.model !== undefined) {
+      await this.setSelectedModel(picked.model);
+    }
   }
 
   post(message) {
@@ -812,6 +936,7 @@ class JcodeChatProvider {
     const selection = this.pendingSelection?.label;
     let sessionId;
     let models = [];
+    let routes = [];
     let current;
     let error;
     try {
@@ -827,6 +952,15 @@ class JcodeChatProvider {
       } catch {
         models = [];
       }
+      try {
+        routes = (await client.getRuntimeInfo(sessionId)).routes || [];
+      } catch {
+        routes = [];
+      }
+      this.modelCatalog = {
+        models: models.length > 0 ? models : this.getModelList(),
+        routes,
+      };
       this.watchModel(client);
     } catch (caught) {
       error = errorMessage(caught);
@@ -1118,7 +1252,7 @@ class JcodeChatProvider {
             title: "Available models",
             rows: catalog.models.map((model) => [model === catalog.current ? "current" : "model", model]),
           });
-          this.post({ type: "openModelPicker" });
+          await this.showModelPicker();
         } catch (error) {
           this.post({ type: "error", text: `/model failed: ${errorMessage(error)}` });
         }
@@ -1730,7 +1864,7 @@ function getChatHtml(webview, context) {
             <button id="selection-toggle" class="small-btn active" type="button" title="Include current editor selection"><svg viewBox="0 0 24 24"><path d="M8 5H5v3M16 5h3v3M8 19H5v-3M16 19h3v-3M9 9h6v6H9z"/></svg><span>Selection</span></button>
           </div>
           <div class="tool-right">
-            <select id="model" class="model-input" aria-label="Model"></select>
+            <button id="model" class="model-picker-button" type="button" aria-label="Select model" aria-haspopup="listbox" title="Select model"><span id="model-label">auto</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></button>
             <select id="effort" class="effort-select" aria-label="Reasoning effort"></select>
             <button id="cancel" class="send-btn" type="button" title="Cancel response" aria-label="Cancel response"><svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1"/></svg></button>
             <button id="send" class="send-btn" type="button" title="Send message" aria-label="Send message"><svg viewBox="0 0 24 24"><path d="M12 19V5M6.5 10.5 12 5l5.5 5.5"/></svg></button>

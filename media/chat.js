@@ -19,7 +19,8 @@
   var selectionToggle = document.getElementById("selection-toggle");
   var attachmentList = document.getElementById("attachments");
   var slashMenu = document.getElementById("slash-menu");
-  var modelInput = document.getElementById("model");
+  var modelButton = document.getElementById("model");
+  var modelLabel = document.getElementById("model-label");
   var effortSelect = document.getElementById("effort");
   var sessionStatus = document.getElementById("session-status");
 
@@ -35,6 +36,8 @@
   var activeTurnId;
   var closedTurnIds = new Set();
   var pendingPastes = 0;
+  var selectedModel = "";
+  var availableModels = [];
 
   function persist() {
     var items = Array.prototype.map.call(messages.querySelectorAll(".chat[data-role]"), function (item) {
@@ -276,23 +279,15 @@
     attachmentList.classList.toggle("visible", attachments.length > 0);
   }
 
-  function populateModelOptions(models, selected) {
-    var names = Array.from(new Set((models || []).filter(Boolean)));
-    modelInput.replaceChildren();
-    var auto = document.createElement("option");
-    auto.value = "";
-    auto.textContent = "Model: auto";
-    modelInput.append(auto);
-    if (selected && !names.includes(selected)) {
-      names.unshift(selected);
+  function applyModelState(models, selected) {
+    availableModels = Array.from(new Set((models || availableModels || []).filter(Boolean)));
+    selectedModel = selected || "";
+    if (selectedModel && !availableModels.includes(selectedModel)) {
+      availableModels.unshift(selectedModel);
     }
-    names.forEach(function (name) {
-      var option = document.createElement("option");
-      option.value = name;
-      option.textContent = name;
-      modelInput.append(option);
-    });
-    modelInput.value = selected || "";
+    modelLabel.textContent = selectedModel || "auto";
+    modelButton.title = selectedModel ? "Model: " + selectedModel : "Model: automatic";
+    modelButton.setAttribute("aria-label", modelButton.title + ". Select model");
   }
 
   function populateEffortOptions(levels) {
@@ -310,7 +305,7 @@
   }
 
   function applyOptions(data) {
-    populateModelOptions(data.models || [], data.model !== undefined ? data.model : modelInput.value);
+    applyModelState(data.models || [], data.model !== undefined ? data.model : selectedModel);
     populateEffortOptions(data.effortLevels || []);
     if (data.effort !== undefined) {
       effortSelect.value = data.effort;
@@ -320,7 +315,7 @@
   function setRunning(running, turnId) {
     document.body.classList.toggle("running", running);
     prompt.disabled = running;
-    modelInput.disabled = running;
+    modelButton.disabled = running;
     effortSelect.disabled = running;
     document.getElementById("attach").disabled = running;
     var typing = document.getElementById("typing");
@@ -420,7 +415,7 @@
       type: "send",
       text: text,
       includeSelection: includeSelection,
-      model: modelInput.value.trim(),
+      model: selectedModel,
       effort: effortSelect.value,
       attachmentIds: attachments.map(function (file) {
         return file.id;
@@ -531,8 +526,8 @@
     selectionToggle.setAttribute("aria-pressed", includeSelection ? "true" : "false");
     selection.classList.toggle("visible", includeSelection && Boolean(selectionLabel.textContent));
   });
-  modelInput.addEventListener("change", function () {
-    vscode.postMessage({ type: "model", model: modelInput.value.trim() });
+  modelButton.addEventListener("click", function () {
+    vscode.postMessage({ type: "chooseModel" });
   });
   effortSelect.addEventListener("change", function () {
     vscode.postMessage({ type: "effort", effort: effortSelect.value });
@@ -576,9 +571,7 @@
         break;
       case "options":
         if (data.model !== undefined) {
-          populateModelOptions(Array.prototype.map.call(modelInput.options, function (option) {
-            return option.value;
-          }), data.model);
+          applyModelState(availableModels, data.model);
         }
         if (data.effort !== undefined) {
           effortSelect.value = data.effort;
@@ -690,9 +683,6 @@
         break;
       case "sessions":
         renderSessionList(data.sessions || [], data.currentSessionId);
-        break;
-      case "openModelPicker":
-        modelInput.focus();
         break;
       case "openEffortPicker":
         effortSelect.focus();
