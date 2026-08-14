@@ -307,14 +307,28 @@ async function run() {
   assert.match(webviewSource, /QuickPickItemKind\.Separator/, "the model picker must group models by provider");
   const pickerItems = await vscode.commands.executeCommand(
     "jcode._test.getModelPickerItems",
-    ["gpt-5.5", "claude-opus-4-6", "custom-model"],
-    [{ model: "custom-model", provider: "custom-provider", available: true }],
+    ["gpt-5.5", "claude-opus-4-6", "custom-model", "offline-model"],
+    [
+      { model: "gpt-5.5", provider: "OpenAI", api_method: "openai-oauth", available: true, detail: "ChatGPT account" },
+      { model: "gpt-5.5", provider: "OpenAI", api_method: "openai-api-key", available: true, detail: "API key" },
+      { model: "claude-opus-4-6", provider: "Anthropic", api_method: "claude-api", available: true, detail: "API key" },
+      { model: "custom-model", provider: "NVIDIA NIM", api_method: "openai-compatible:nvidia-nim", available: true, detail: "Connected profile" },
+      { model: "offline-model", provider: "Offline provider", api_method: "current", available: false, detail: "Missing credentials" },
+    ],
     "gpt-5.5",
+    "OpenAI",
+    ["OpenAI", "Anthropic", "NVIDIA NIM", "Offline provider"],
   );
   const separators = pickerItems.filter((item) => item.kind === vscode.QuickPickItemKind.Separator).map((item) => item.label);
-  assert.deepEqual(separators, ["Automatic", "Anthropic", "custom-provider", "OpenAI"]);
-  assert.equal(pickerItems.find((item) => item.model === "gpt-5.5").description, "Current");
-  assert.equal(pickerItems.find((item) => item.model === "custom-model").detail, "custom-provider");
+  assert.deepEqual(separators, ["Automatic", "OpenAI", "Anthropic", "NVIDIA NIM", "Offline provider"]);
+  const openAiRoutes = pickerItems.filter((item) => item.displayModel === "gpt-5.5");
+  assert.deepEqual(openAiRoutes.map((item) => item.model), ["openai-api:gpt-5.5", "openai-oauth:gpt-5.5"]);
+  assert.ok(openAiRoutes.every((item) => item.description === "Current"));
+  assert.match(pickerItems.find((item) => item.displayModel === "custom-model").detail, /openai-compatible:nvidia-nim/);
+  assert.equal(pickerItems.find((item) => item.displayModel === "custom-model").model, "nvidia-nim:custom-model");
+  const unavailableRoute = pickerItems.find((item) => item.displayModel === "offline-model");
+  assert.equal(unavailableRoute.model, undefined);
+  assert.equal(unavailableRoute.description, "Unavailable");
 
   let frames = await readBridgeFrames(bridgeLog);
   const createFrame = frames.find((frame) => frame.req === "create_session");
@@ -373,6 +387,23 @@ async function run() {
   assert.ok(setModelFrame, "changing the model must call set_model");
   assert.equal(setModelFrame.model, "gpt-5.5");
   assert.equal(setModelFrame.session_id, "fake-session-1");
+
+  await vscode.commands.executeCommand(
+    "jcode._test.setModel",
+    "openai-oauth:gpt-5.5",
+    "gpt-5.5",
+    "OpenAI",
+  );
+  frames = await readBridgeFrames(bridgeLog);
+  assert.ok(
+    frames.some((frame) => frame.req === "set_model" && frame.model === "openai-oauth:gpt-5.5"),
+    "choosing a provider route must send Jcode's exact routed model spec",
+  );
+  assert.equal(
+    (await vscode.commands.executeCommand("jcode._test.getChatState")).model,
+    "gpt-5.5",
+    "the composer must show the clean model name rather than its routing prefix",
+  );
 
   await vscode.commands.executeCommand("jcode._test.setEffort", "high");
   frames = await readBridgeFrames(bridgeLog);

@@ -24,6 +24,7 @@ const TERMINAL_NAME = "Jcode";
 const CHAT_VIEW_ID = "jcode.chatView";
 const CHAT_SESSION_KEY = "jcode.chat.sessionId";
 const CHAT_MODEL_KEY = "jcode.chat.model";
+const CHAT_MODEL_ROUTE_KEY = "jcode.chat.modelRoute";
 const CHAT_EFFORT_KEY = "jcode.chat.effort";
 const CHAT_BOOKMARKS_KEY = "jcode.chat.bookmarks";
 const CHAT_RUNTIME_STATES_KEY = "jcode.chat.runtimeStates";
@@ -51,7 +52,7 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.8.1";
+const CLIENT_NAME = "jcode-vscode/0.9.0";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -467,8 +468,8 @@ function activate(context) {
       ),
       vscode.commands.registerCommand("jcode._test.newChat", () => chatProvider.newChat()),
       vscode.commands.registerCommand("jcode._test.cancelChat", () => chatProvider.cancel()),
-      vscode.commands.registerCommand("jcode._test.setModel", (model) =>
-        chatProvider.setSelectedModel(model),
+      vscode.commands.registerCommand("jcode._test.setModel", (model, displayModel, provider) =>
+        chatProvider.setSelectedModel(model, false, displayModel ?? model, provider),
       ),
       vscode.commands.registerCommand("jcode._test.setEffort", (effort) =>
         chatProvider.setSelectedEffort(effort),
@@ -506,11 +507,13 @@ function activate(context) {
         await chatProvider.postChain;
         return chatProvider.testPostedMessages || [];
       }),
-      vscode.commands.registerCommand("jcode._test.getModelPickerItems", (models, routes, current) =>
-        buildModelQuickPickItems(models, routes, current).map((item) => ({
+      vscode.commands.registerCommand("jcode._test.getModelPickerItems", (models, routes, current, currentProvider, providers) =>
+        buildModelQuickPickItems(models, routes, current, currentProvider, providers).map((item) => ({
           label: item.label,
           kind: item.kind,
           model: item.model,
+          displayModel: item.displayModel,
+          provider: item.provider,
           description: item.description,
           detail: item.detail,
         })),
@@ -571,28 +574,65 @@ function inferredModelProvider(model) {
   return MODEL_PROVIDER_PREFIXES.find(([prefix]) => normalized.startsWith(prefix))?.[1] || "Other";
 }
 
-function buildModelQuickPickItems(models, routes, current) {
+function routeModelSpec(route) {
+  const model = String(route?.model || "").trim();
+  const method = String(route?.api_method || "").trim().toLowerCase();
+  if (!model) return "";
+  if (method === "claude-oauth") return `claude-oauth:${model}`;
+  if (["claude-api", "anthropic-api", "anthropic-api-key", "claude-api-key"].includes(method)) {
+    return `claude-api:${model}`;
+  }
+  if (["openai", "openai-oauth"].includes(method)) return `openai-oauth:${model}`;
+  if (["openai-api", "openai-api-key", "openai-key", "openai-apikey"].includes(method)) {
+    return `openai-api:${model}`;
+  }
+  if (method.startsWith("openai-compatible:")) {
+    const profile = method.slice("openai-compatible:".length).trim();
+    return profile ? `${profile}:${model}` : model;
+  }
+  if (["copilot", "cursor", "bedrock"].includes(method)) return `${method}:${model}`;
+  if (method === "openrouter") {
+    let catalogModel = model;
+    if (!catalogModel.includes("/")) {
+      const provider = inferredModelProvider(catalogModel);
+      if (provider === "Anthropic") catalogModel = `anthropic/${catalogModel}`;
+      if (provider === "OpenAI") catalogModel = `openai/${catalogModel}`;
+    }
+    const provider = String(route?.provider || "").trim();
+    return !provider || provider.toLowerCase() === "auto" || catalogModel.includes("@")
+      ? catalogModel
+      : `${catalogModel}@${provider}`;
+  }
+  return model;
+}
+
+function buildModelQuickPickItems(models, routes, current, currentProvider, providers = []) {
   const names = Array.from(new Set((models || []).filter(Boolean)));
   if (current && !names.includes(current)) names.unshift(current);
-
-  const routeProviders = new Map();
+  const validRoutes = [];
+  const routeKeys = new Set();
   for (const route of routes || []) {
-    if (!route?.model || !route?.provider || route.available === false) continue;
-    const providers = routeProviders.get(route.model) || new Set();
-    providers.add(route.provider);
-    routeProviders.set(route.model, providers);
+    if (!route?.model || !route?.provider) continue;
+    const key = [route.provider, route.api_method || "", route.model].join("\u0000");
+    if (routeKeys.has(key)) continue;
+    routeKeys.add(key);
+    validRoutes.push(route);
   }
 
   const groups = new Map();
+  const ensureGroup = (provider) => {
+    const label = String(provider || "Other");
+    if (!groups.has(label)) groups.set(label, []);
+    return groups.get(label);
+  };
+  for (const provider of providers || []) ensureGroup(provider);
+  for (const route of validRoutes) ensureGroup(route.provider).push(route);
+
+  const routedModels = new Set(validRoutes.map((route) => route.model));
   for (const model of names) {
-    const providers = Array.from(routeProviders.get(model) || []);
-    const provider = providers.length === 1
-      ? providers[0]
-      : providers.length > 1
-        ? "Multiple providers"
-        : inferredModelProvider(model);
-    if (!groups.has(provider)) groups.set(provider, []);
-    groups.get(provider).push(model);
+    if (routedModels.has(model)) continue;
+    const provider = model === current && currentProvider ? currentProvider : inferredModelProvider(model);
+    ensureGroup(provider).push({ model, provider, available: true, inferred: true });
   }
 
   const items = [
@@ -605,15 +645,33 @@ function buildModelQuickPickItems(models, routes, current) {
       picked: !current,
     },
   ];
-  for (const provider of Array.from(groups.keys()).sort((a, b) => a.localeCompare(b))) {
+  const providerOrder = Array.from(groups.keys()).sort((a, b) => {
+    if (a === currentProvider) return -1;
+    if (b === currentProvider) return 1;
+    return a.localeCompare(b);
+  });
+  for (const provider of providerOrder) {
     items.push({ label: provider, kind: vscode.QuickPickItemKind.Separator });
-    for (const model of groups.get(provider).sort((a, b) => a.localeCompare(b))) {
+    const providerRoutes = groups.get(provider).sort((a, b) => {
+      if (a.available !== b.available) return a.available === false ? 1 : -1;
+      return String(a.model).localeCompare(String(b.model)) || String(a.api_method || "").localeCompare(String(b.api_method || ""));
+    });
+    for (const route of providerRoutes) {
+      const model = route.model;
+      const spec = route.inferred ? model : routeModelSpec(route);
+      const isCurrent = model === current && (!currentProvider || provider.toLowerCase() === String(currentProvider).toLowerCase());
+      const unavailable = route.available === false;
+      const description = [isCurrent ? "Current" : "", unavailable ? "Unavailable" : ""].filter(Boolean).join(" · ") || undefined;
+      const routeDetail = [route.api_method, route.detail].filter(Boolean).join(" · ");
       items.push({
         label: model,
-        description: model === current ? "Current" : undefined,
-        detail: provider,
-        model,
-        picked: model === current,
+        description,
+        detail: routeDetail || provider,
+        model: unavailable ? undefined : spec,
+        displayModel: model,
+        provider,
+        route,
+        picked: isCurrent,
       });
     }
   }
@@ -698,7 +756,7 @@ class JcodeChatProvider {
     this.sessionInitPromise = undefined;
     this.modelWatcher = undefined;
     this.modelWatcherClient = undefined;
-    this.modelCatalog = { models: this.getModelList(), routes: [] };
+    this.modelCatalog = { models: this.getModelList(), routes: [], providers: [], currentProvider: undefined };
     this.runtimeState = this.loadRuntimeState(this.context.workspaceState.get(CHAT_SESSION_KEY));
     this.disposed = false;
     this.nextTurnId = 1;
@@ -801,6 +859,10 @@ class JcodeChatProvider {
     return vscode.workspace.getConfiguration("jcode").get("defaultModel", "");
   }
 
+  getSelectedModelRequest() {
+    return this.context.workspaceState.get(CHAT_MODEL_ROUTE_KEY) || this.getSelectedModel();
+  }
+
   getSelectedEffort() {
     const saved = this.context.workspaceState.get(CHAT_EFFORT_KEY);
     if (saved) {
@@ -877,6 +939,8 @@ class JcodeChatProvider {
 
     let models = this.modelCatalog.models;
     let routes = this.modelCatalog.routes;
+    let providers = this.modelCatalog.providers;
+    let currentProvider = this.modelCatalog.currentProvider;
     let current = this.getSelectedModel();
     try {
       const client = await this.ensureSession();
@@ -886,13 +950,15 @@ class JcodeChatProvider {
       ]);
       models = catalog.models.length > 0 ? catalog.models : this.getModelList();
       routes = runtime?.routes || [];
-      current = catalog.current || current;
-      this.modelCatalog = { models, routes };
+      providers = runtime?.providers || [];
+      currentProvider = runtime?.provider;
+      current = runtime?.model || catalog.current || current;
+      this.modelCatalog = { models, routes, providers, currentProvider };
     } catch {
       // Keep the latest catalog so the picker remains useful while reconnecting.
     }
 
-    const items = buildModelQuickPickItems(models, routes, current);
+    const items = buildModelQuickPickItems(models, routes, current, currentProvider, providers);
     const picked = await vscode.window.showQuickPick(items, {
       title: "Select Jcode Model",
       placeHolder: "Search models by name or provider",
@@ -900,7 +966,7 @@ class JcodeChatProvider {
       matchOnDetail: true,
     });
     if (picked && picked.model !== undefined) {
-      await this.setSelectedModel(picked.model);
+      await this.setSelectedModel(picked.model, false, picked.displayModel, picked.provider);
     }
   }
 
@@ -928,8 +994,9 @@ class JcodeChatProvider {
     });
   }
 
-  async setSelectedModel(model, allowWhileRunning = false) {
+  async setSelectedModel(model, allowWhileRunning = false, displayModel = model, provider) {
     const value = typeof model === "string" ? model.trim() : "";
+    const displayValue = typeof displayModel === "string" ? displayModel.trim() : value;
     const previous = this.getSelectedModel();
     if (this.running && !allowWhileRunning) {
       this.post({ type: "notice", text: "Cancel the active response before changing models." });
@@ -938,6 +1005,7 @@ class JcodeChatProvider {
     }
     if (!value) {
       await this.context.workspaceState.update(CHAT_MODEL_KEY, undefined);
+      await this.context.workspaceState.update(CHAT_MODEL_ROUTE_KEY, undefined);
       this.post({ type: "options", model: previous });
       this.post({ type: "notice", text: "Automatic model selection applies to the next new chat." });
       return true;
@@ -945,8 +1013,10 @@ class JcodeChatProvider {
     try {
       const client = await this.ensureSession();
       await client.setModel(this.sessionId, value);
-      await this.context.workspaceState.update(CHAT_MODEL_KEY, value);
-      this.post({ type: "options", model: value });
+      await this.context.workspaceState.update(CHAT_MODEL_KEY, displayValue);
+      await this.context.workspaceState.update(CHAT_MODEL_ROUTE_KEY, value === displayValue ? undefined : value);
+      this.modelCatalog.currentProvider = provider || this.modelCatalog.currentProvider;
+      this.post({ type: "options", model: displayValue });
       return true;
     } catch (error) {
       this.post({ type: "options", model: previous });
@@ -1039,7 +1109,7 @@ class JcodeChatProvider {
   }
 
   async applySessionDefaults(client) {
-    const model = this.getSelectedModel();
+    const model = this.getSelectedModelRequest();
     if (model) {
       try {
         await client.setModel(this.sessionId, model);
@@ -1065,6 +1135,8 @@ class JcodeChatProvider {
     let sessionId;
     let models = [];
     let routes = [];
+    let providers = [];
+    let currentProvider;
     let current;
     let error;
     try {
@@ -1081,13 +1153,19 @@ class JcodeChatProvider {
         models = [];
       }
       try {
-        routes = (await client.getRuntimeInfo(sessionId)).routes || [];
+        const runtime = await client.getRuntimeInfo(sessionId);
+        routes = runtime.routes || [];
+        providers = runtime.providers || [];
+        currentProvider = runtime.provider;
+        current = runtime.model || current;
       } catch {
         routes = [];
       }
       this.modelCatalog = {
         models: models.length > 0 ? models : this.getModelList(),
         routes,
+        providers,
+        currentProvider,
       };
       this.runtimeState = this.loadRuntimeState(sessionId);
       this.watchModel(client);
@@ -1178,7 +1256,11 @@ class JcodeChatProvider {
     }
     this.modelWatcher = (event) => {
       if (event.session_id === this.sessionId && event.model) {
+        const changedRoute = event.model !== this.getSelectedModel()
+          || (event.provider && this.modelCatalog.currentProvider && event.provider !== this.modelCatalog.currentProvider);
         void this.context.workspaceState.update(CHAT_MODEL_KEY, event.model);
+        if (changedRoute) void this.context.workspaceState.update(CHAT_MODEL_ROUTE_KEY, undefined);
+        this.modelCatalog.currentProvider = event.provider || this.modelCatalog.currentProvider;
         this.post({ type: "options", model: event.model });
       }
     };
@@ -1951,7 +2033,9 @@ function openJcodeTerminal(context, editor = getCurrentTextEditor()) {
   const cwd = getWorkingDirectory(editor);
   const args = cwd ? ["-C", cwd, ...configuredArguments] : configuredArguments;
 
-  const model = context.workspaceState.get(CHAT_MODEL_KEY) || config.get("defaultModel", "");
+  const model = context.workspaceState.get(CHAT_MODEL_ROUTE_KEY)
+    || context.workspaceState.get(CHAT_MODEL_KEY)
+    || config.get("defaultModel", "");
   const hasExplicitModel = args.includes("-m") || args.includes("--model");
   if (model && !hasExplicitModel) {
     args.push("-m", model);

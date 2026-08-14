@@ -25,7 +25,9 @@ and lets the user explicitly send editor selections to the agent.
   with the command prefilled, e.g. `/login`, `/update`, `/permissions`). Prefix
   a prompt with `//` when it must begin with a literal `/`.
 - The sidebar chat renders streaming text, collapsible reasoning, tool-call
-  rows, and token usage. Compact composer icons mirror Todo, confidence,
+  rows, token usage, and sanitized GitHub-flavored Markdown including headings,
+  lists, links, blockquotes, tables, inline code, and fenced code blocks. Compact
+  composer icons mirror Todo, confidence,
   session KV-cache, and context status; clicking an icon opens the detailed
   Todo and metrics popover. State is retained per session and context-window
   inference follows Jcode's model-family defaults (overridable with
@@ -41,12 +43,16 @@ and lets the user explicitly send editor selections to the agent.
   `npm run check:webview` instead of failing silently at runtime.
 - The Chat page uses a compact Claude Code-inspired layout with a floating composer,
   starter prompts, attachment chips, command cards, and live connection status.
-- The Chat page has a VS Code native Quick Pick populated from Jcode's live model
-  catalog and grouped by SDK route provider, plus a reasoning-effort selector
-  (`none` … `max`, subject to what the provider accepts).
-  Choices persist per workspace and are applied to the chat session through the
-  Jcode SDK (`listModels` / `setModel` / `setReasoningEffort`), and to the terminal
-  agent through `-m` and the reasoning-effort environment variables.
+- The Chat page has a VS Code native Quick Pick populated from Jcode's live
+  `getRuntimeInfo().providers/routes` catalog and grouped by the actual route
+  provider. Duplicate model names remain separate when they use different auth or
+  API routes, unavailable routes are labelled, and selection sends Jcode's exact
+  routed model spec (`claude-api:`, `openai-oauth:`, OpenRouter `@provider`, or an
+  OpenAI-compatible profile) instead of an inferred model name. A reasoning-effort
+  selector supports `none` … `max`, subject to what the provider accepts. Choices
+  persist per workspace and are applied through the Jcode SDK (`listModels` /
+  `getRuntimeInfo` / `setModel` / `setReasoningEffort`), and to the terminal agent
+  through `-m` and the reasoning-effort environment variables.
 - Select code and press `Ctrl+Shift+J` (`Cmd+Shift+J` on macOS) to attach it and focus Chat.
 - The editor context menu includes ask, explain, and fix commands.
 - Multiple selections are supported.

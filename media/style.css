@@ -105,7 +105,53 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   font-size: 10px; font-weight: 700;
 }
 .chat-user .avatar { color: var(--vscode-foreground); background: var(--vscode-badge-background); }
-.chat-bubble { white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.chat-bubble { white-space: normal; overflow-wrap: anywhere; user-select: text; line-height: 1.55; }
+.chat-bubble > :first-child { margin-top: 0; }
+.chat-bubble > :last-child { margin-bottom: 0; }
+.chat-bubble p { margin: 0.45em 0; }
+.chat-bubble h1, .chat-bubble h2, .chat-bubble h3, .chat-bubble h4, .chat-bubble h5, .chat-bubble h6 {
+  margin: 0.9em 0 0.4em;
+  color: var(--vscode-foreground);
+  line-height: 1.25;
+  font-weight: 600;
+}
+.chat-bubble h1 { font-size: 1.35em; }
+.chat-bubble h2 { font-size: 1.22em; }
+.chat-bubble h3 { font-size: 1.1em; }
+.chat-bubble ul, .chat-bubble ol { margin: 0.45em 0; padding-left: 1.7em; }
+.chat-bubble li { margin: 0.18em 0; }
+.chat-bubble blockquote {
+  margin: 0.65em 0;
+  padding: 0.1em 0 0.1em 0.8em;
+  border-left: 2px solid var(--vscode-textBlockQuote-border, var(--vscode-widget-border));
+  color: var(--vscode-descriptionForeground);
+}
+.chat-bubble code {
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.92em;
+}
+.chat-bubble :not(pre) > code {
+  padding: 0.12em 0.32em;
+  border-radius: 4px;
+  color: var(--vscode-textPreformat-foreground, var(--vscode-foreground));
+  background: var(--vscode-textCodeBlock-background, var(--vscode-editorWidget-background));
+}
+.chat-bubble pre {
+  margin: 0.7em 0;
+  padding: 9px 10px;
+  overflow: auto;
+  border: 1px solid color-mix(in srgb, var(--vscode-widget-border) 70%, transparent);
+  border-radius: 7px;
+  background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
+  white-space: pre;
+}
+.chat-bubble pre code { padding: 0; background: transparent; }
+.chat-bubble a { color: var(--vscode-textLink-foreground); text-decoration: none; }
+.chat-bubble a:hover { color: var(--vscode-textLink-activeForeground); text-decoration: underline; }
+.chat-bubble hr { height: 1px; margin: 0.9em 0; border: 0; background: var(--vscode-widget-border); }
+.chat-bubble table { display: block; max-width: 100%; margin: 0.65em 0; overflow-x: auto; border-collapse: collapse; }
+.chat-bubble th, .chat-bubble td { padding: 5px 7px; border: 1px solid var(--vscode-widget-border); text-align: left; }
+.chat-bubble th { background: var(--vscode-editorWidget-background); font-weight: 600; }
 .chat-user .chat-bubble {
   padding: 10px 11px;
   border: 1px solid var(--vscode-widget-border);
