@@ -14,8 +14,12 @@ commands for asking, explaining, and fixing code.
 - The Jcode icon in the Activity Bar opens a native sidebar Chat page.
 - `Jcode: Open Chat` focuses the Chat page. `Jcode: Open Terminal Agent` starts the
   full Jcode TUI in the current workspace.
-- The Chat page supports multi-turn sessions, New Chat, cancellation, live streaming
-  replies, workspace prompts, and an optional current-selection attachment.
+- The conversation title in the Chat header opens a session switcher. Select any
+  active Jcode session to replace the visible transcript with that session's history and
+  continue talking in it directly. New Chat starts a separate conversation without
+  mixing messages from the previous session.
+- The Chat page supports multi-turn sessions, cancellation, live streaming replies,
+  workspace prompts, and an optional current-selection attachment.
 - The Parallel tasks dashboard runs multiple Jcode sessions at once. Each worker has
   its own prompt, status, output, model, effort, and cancellation control. A bounded
   queue enforces `jcode.multiSession.maxConcurrent`, dependencies delay downstream
@@ -102,8 +106,9 @@ npm run package
 
 - extension activation and command registration;
 - Activity Bar container and Webview view contributions;
-- chat sessions over the harness API: session creation, multi-turn reuse, New Chat,
-  streaming replies, model and reasoning-effort switching, native slash-command
+- chat sessions over the harness API: session creation, multi-turn reuse, direct
+  switching with isolated transcript restoration, New Chat, streaming replies,
+  model and reasoning-effort switching, native slash-command
   routing (including in-flight `/cancel` and literal slash escaping), image
   attachments, and cancellation (against a fake bridge that speaks the SDK protocol);
 - parallel task sessions: concurrent execution, distinct session IDs, independent

@@ -53,7 +53,7 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.10.0";
+const CLIENT_NAME = "jcode-vscode/0.10.1";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -483,6 +483,16 @@ function activate(context) {
         chatProvider.addPastedImage({ mediaType, data, name }),
       ),
       vscode.commands.registerCommand("jcode._test.newChat", () => chatProvider.newChat()),
+      vscode.commands.registerCommand("jcode._test.listSessions", () => chatProvider.openSessions()),
+      vscode.commands.registerCommand("jcode._test.attachSession", async (sessionId) => {
+        const attached = await chatProvider.attachToSession(sessionId);
+        let pending;
+        do {
+          pending = chatProvider.postChain;
+          await pending;
+        } while (pending !== chatProvider.postChain);
+        return attached;
+      }),
       vscode.commands.registerCommand("jcode._test.cancelChat", () => chatProvider.cancel()),
       vscode.commands.registerCommand("jcode._test.setModel", (model, displayModel, provider) =>
         chatProvider.setSelectedModel(model, false, displayModel ?? model, provider),
@@ -544,7 +554,11 @@ function activate(context) {
         chatProvider.testPostedMessages = posted;
       }),
       vscode.commands.registerCommand("jcode._test.getPostedMessages", async () => {
-        await chatProvider.postChain;
+        let pending;
+        do {
+          pending = chatProvider.postChain;
+          await pending;
+        } while (pending !== chatProvider.postChain);
         return chatProvider.testPostedMessages || [];
       }),
       vscode.commands.registerCommand("jcode._test.getModelPickerItems", (models, routes, current, currentProvider, providers) =>
@@ -794,6 +808,10 @@ class JcodeChatProvider {
     this.sessionId = undefined;
     this.sessionClient = undefined;
     this.sessionInitPromise = undefined;
+    this.sessionTransition = Promise.resolve();
+    this.pendingSessionTransitions = 0;
+    this.activeTurnSettled = Promise.resolve();
+    this.resolveActiveTurnSettled = undefined;
     this.modelWatcher = undefined;
     this.modelWatcherClient = undefined;
     this.modelCatalog = { models: this.getModelList(), routes: [], providers: [], currentProvider: undefined };
@@ -835,7 +853,7 @@ class JcodeChatProvider {
           this.postBootstrap();
           await this.taskManager.initialize();
           log("bootstrap posted");
-          void this.restoreChat();
+          void this.queueSessionTransition(() => this.restoreChat());
           break;
         case "send":
           await this.sendMessage(message.text, message.includeSelection !== false, undefined, {
@@ -858,6 +876,9 @@ class JcodeChatProvider {
           break;
         case "newChat":
           await this.newChat();
+          break;
+        case "listSessions":
+          await this.openSessions();
           break;
         case "openTerminal":
           openJcodeTerminal(this.context);
@@ -1089,6 +1110,19 @@ class JcodeChatProvider {
         log(`webview post failed: ${errorMessage(error)}`);
       }
     });
+    return this.postChain;
+  }
+
+  queueSessionTransition(operation) {
+    this.pendingSessionTransitions += 1;
+    const transition = this.sessionTransition
+      .catch(() => undefined)
+      .then(operation)
+      .finally(() => {
+        this.pendingSessionTransitions -= 1;
+      });
+    this.sessionTransition = transition.catch(() => undefined);
+    return transition;
   }
 
   postBootstrap() {
@@ -1249,6 +1283,7 @@ class JcodeChatProvider {
     let providers = [];
     let currentProvider;
     let current;
+    let history = [];
     let error;
     try {
       const client = await withTimeout(
@@ -1279,11 +1314,16 @@ class JcodeChatProvider {
         currentProvider,
       };
       this.runtimeState = this.loadRuntimeState(sessionId);
+      try {
+        history = await client.getHistory(sessionId);
+      } catch {
+        history = [];
+      }
       this.watchModel(client);
     } catch (caught) {
       error = errorMessage(caught);
     }
-    this.post({
+    await this.post({
       type: "restore",
       sessionId,
       selection,
@@ -1294,8 +1334,10 @@ class JcodeChatProvider {
       slashCommands: SLASH_COMMANDS.filter((command) => !command.hidden),
       attachments: [...this.attachments.values()].map(publicAttachment),
       runtimeState: this.runtimeState,
+      history: publicHistory(history),
       error,
     });
+    await this.openSessions(false);
   }
 
   async chooseAttachments() {
@@ -1407,6 +1449,11 @@ class JcodeChatProvider {
       this.post({ type: "sendRejected", text: typeof text === "string" ? text : "" });
       return undefined;
     }
+    if (this.pendingSessionTransitions > 0) {
+      this.post({ type: "notice", text: "Wait for the conversation switch to finish before sending." });
+      this.post({ type: "sendRejected", text: instruction });
+      return undefined;
+    }
 
     const literalSlash = instruction.startsWith("//");
     if (literalSlash) {
@@ -1436,6 +1483,9 @@ class JcodeChatProvider {
     this.activeTurnId = turnId;
     this.running = true;
     this.cancelRequested = false;
+    this.activeTurnSettled = new Promise((resolve) => {
+      this.resolveActiveTurnSettled = resolve;
+    });
     this.post({ type: "running", running: true, turnId });
     let attachments;
     let submitted = false;
@@ -1516,6 +1566,8 @@ class JcodeChatProvider {
         this.activeTurnId = undefined;
         this.post({ type: "running", running: false, turnId });
       }
+      this.resolveActiveTurnSettled?.();
+      this.resolveActiveTurnSettled = undefined;
     }
   }
 
@@ -1715,6 +1767,9 @@ class JcodeChatProvider {
     this.activeTurnId = turnId;
     this.running = true;
     this.cancelRequested = false;
+    this.activeTurnSettled = new Promise((resolve) => {
+      this.resolveActiveTurnSettled = resolve;
+    });
     this.post({ type: "running", running: true, turnId });
     try {
       const selection = this.pendingSelection || await captureSelectionContext(this.context, false);
@@ -1741,6 +1796,8 @@ class JcodeChatProvider {
         this.activeTurnId = undefined;
         this.post({ type: "running", running: false, turnId });
       }
+      this.resolveActiveTurnSettled?.();
+      this.resolveActiveTurnSettled = undefined;
     }
   }
 
@@ -1762,28 +1819,39 @@ class JcodeChatProvider {
     return true;
   }
 
-  async openSessions() {
+  async openSessions(open = true) {
     try {
       const client = await getJcodeClient();
       const sessions = await client.listSessions();
-      this.post({ type: "sessions", sessions, currentSessionId: this.sessionId });
+      await this.post({ type: "sessions", sessions, currentSessionId: this.sessionId, open });
     } catch (error) {
       this.post({ type: "error", text: `Could not list sessions: ${errorMessage(error)}` });
     }
   }
 
-  async attachToSession(sessionId) {
+  attachToSession(sessionId) {
+    return this.queueSessionTransition(() => this.attachToSessionNow(sessionId));
+  }
+
+  async attachToSessionNow(sessionId) {
     try {
+      if (this.running) {
+        this.post({ type: "error", text: "Cancel the active response before switching conversations." });
+        this.post({ type: "sessionSwitchFailed" });
+        return false;
+      }
       const client = await getJcodeClient();
       await client.attachSession(sessionId);
       this.sessionId = sessionId;
       this.sessionClient = client;
       this.sessionInitPromise = undefined;
       await this.context.workspaceState.update(CHAT_SESSION_KEY, sessionId);
-      this.post({ type: "notice", text: `Attached to ${sessionId}.` });
-      void this.restoreChat();
+      await this.restoreChat();
+      return true;
     } catch (error) {
       this.post({ type: "error", text: `Could not attach to session: ${errorMessage(error)}` });
+      this.post({ type: "sessionSwitchFailed" });
+      return false;
     }
   }
 
@@ -1792,6 +1860,7 @@ class JcodeChatProvider {
       const client = await getJcodeClient();
       await client.renameSession(sessionId, title);
       this.post({ type: "notice", text: title ? `Session renamed to ${title}.` : "Session title cleared." });
+      await this.openSessions(false);
     } catch (error) {
       this.post({ type: "error", text: `Could not rename session: ${errorMessage(error)}` });
     }
@@ -1863,11 +1932,13 @@ class JcodeChatProvider {
   }
 
   async runTurn(prompt, images = [], turnId, attachmentState) {
+    const previousSessionId = this.sessionId;
     const client = await this.ensureSession();
     if (!this.isTurnActive(turnId)) {
       throw cancelledError();
     }
     const sessionId = this.sessionId;
+    if (sessionId !== previousSessionId) void this.openSessions(false);
     let provider;
     let model;
     const toolInputs = new Map();
@@ -1994,9 +2065,25 @@ class JcodeChatProvider {
     }
   }
 
-  async newChat() {
+  newChat() {
+    return this.queueSessionTransition(() => this.newChatNow()).catch((error) => {
+      this.post({ type: "error", text: `Could not create a new conversation: ${errorMessage(error)}` });
+      return false;
+    });
+  }
+
+  async newChatNow() {
     if (this.running) {
+      const turnSettled = this.activeTurnSettled;
       await this.cancel();
+      await withTimeout(turnSettled, 30000, "waiting for the active response to cancel");
+    }
+    if (this.sessionInitPromise) {
+      try {
+        await this.sessionInitPromise;
+      } catch {
+        // The failed initialization is discarded below before creating fresh.
+      }
     }
     this.sessionId = undefined;
     this.sessionClient = undefined;
@@ -2004,9 +2091,18 @@ class JcodeChatProvider {
     this.attachments.clear();
     this.runtimeState = emptyRuntimeState(this.getSelectedModel(), this.configuredContextLimit());
     await this.context.workspaceState.update(CHAT_SESSION_KEY, undefined);
-    this.post({ type: "cleared" });
-    this.post({ type: "runtimeState", state: this.runtimeState });
-    this.post({ type: "notice", text: "New chat. The next message creates a fresh session." });
+    try {
+      await this.ensureSession();
+      if (!this.sessionId) throw new Error("Jcode did not return a new session ID");
+      await this.restoreChat();
+      this.post({ type: "notice", text: "New conversation created." });
+      return true;
+    } catch (error) {
+      this.post({ type: "cleared" });
+      this.post({ type: "runtimeState", state: this.runtimeState });
+      this.post({ type: "error", text: `Could not create a new conversation: ${errorMessage(error)}` });
+      return false;
+    }
   }
 
   dispose() {
@@ -2023,6 +2119,16 @@ function publicAttachment(attachment) {
     kind: attachment.kind,
     mediaType: attachment.mediaType,
   };
+}
+
+function publicHistory(history) {
+  return (Array.isArray(history) ? history : [])
+    .slice(-200)
+    .filter((message) => message && typeof message.content === "string")
+    .map((message) => ({
+      role: ["user", "assistant", "tool"].includes(message.role) ? message.role : "assistant",
+      content: message.content,
+    }));
 }
 
 function runJcodeCli(executable, args) {
@@ -2235,13 +2341,17 @@ function getChatHtml(webview, context) {
 <body>
   <main class="app">
     <header class="topbar">
-      <div class="brand"><span class="brand-mark">J</span><span class="brand-copy"><span class="title">Jcode</span><small id="session-status">Connecting…</small></span></div>
+      <div class="brand"><span class="brand-mark">J</span><span class="brand-copy"><button id="sessions-toggle" class="session-current" type="button" aria-label="Switch conversation" aria-expanded="false"><span id="session-name">New conversation</span><svg viewBox="0 0 16 16"><path d="m4 6 4 4 4-4"/></svg></button><small id="session-status">Connecting…</small></span></div>
       <div class="top-actions">
         <button id="tasks-toggle" class="icon-btn task-toggle" title="Parallel tasks" aria-label="Parallel tasks"><svg viewBox="0 0 24 24"><path d="M4 6h6M4 12h10M4 18h8M17 5v6M14 8h6"/></svg><span id="task-badge" class="task-badge"></span></button>
         <button id="terminal" class="icon-btn" title="Open terminal agent" aria-label="Open terminal agent"><svg viewBox="0 0 24 24"><path d="m5 7 4 4-4 4M11 17h7"/></svg></button>
         <button id="new-chat" class="icon-btn" title="New chat" aria-label="New chat"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
       </div>
     </header>
+    <aside id="session-panel" class="session-panel" hidden>
+      <div class="session-panel-header"><div><strong>Conversations</strong><small>Switch and continue any Jcode session</small></div><button id="session-new" class="small-btn" type="button">+ New</button></div>
+      <div id="session-list" class="session-list"></div>
+    </aside>
     <aside id="task-panel" class="task-panel" hidden>
       <div class="task-panel-header">
         <div><strong>Parallel tasks</strong><small id="task-summary">No tasks</small></div>

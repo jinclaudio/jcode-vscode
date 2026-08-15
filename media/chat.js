@@ -36,12 +36,17 @@
   var taskPanel = document.getElementById("task-panel");
   var taskForm = document.getElementById("task-form");
   var taskList = document.getElementById("task-list");
+  var sessionPanel = document.getElementById("session-panel");
+  var sessionList = document.getElementById("session-list");
+  var sessionName = document.getElementById("session-name");
   var tasks = [];
   var maxConcurrent = 3;
   var taskDefaultMode = "worktree";
   var taskDefaultAutoCommit = true;
 
   var saved = vscode.getState() || { messages: [] };
+  var currentSessionId = saved.sessionId;
+  var suppressPersist = false;
   var liveBubble;
   var attachments = [];
   var slashCommands = [];
@@ -82,6 +87,7 @@
   }
 
   function persist() {
+    if (suppressPersist) return;
     var items = Array.prototype.map.call(messages.querySelectorAll(".chat[data-role]"), function (item) {
       return {
         role: item.dataset.role,
@@ -90,7 +96,7 @@
         attachments: JSON.parse(item.dataset.attachments || "[]"),
       };
     });
-    vscode.setState({ messages: items });
+    vscode.setState({ sessionId: currentSessionId, messages: items });
   }
 
   function attachmentIcon(kind) {
@@ -200,6 +206,30 @@
     notice.textContent = text;
     messages.append(notice);
     messages.scrollTop = messages.scrollHeight;
+  }
+
+  function clearConversation() {
+    activeTurnId = undefined;
+    closedTurnIds.clear();
+    liveBubble = undefined;
+    messages.querySelectorAll(":scope > :not(#empty)").forEach(function (node) {
+      node.remove();
+    });
+    empty.hidden = false;
+  }
+
+  function renderConversation(history, sessionId) {
+    suppressPersist = true;
+    clearConversation();
+    currentSessionId = sessionId || undefined;
+    (history || []).forEach(function (message) {
+      if (message.role === "user") appendMessage("user", message.content, "", []);
+      else if (message.role === "tool") appendMessage("assistant", message.content, "Tool", []);
+      else appendMessage("assistant", message.content, "", []);
+    });
+    suppressPersist = false;
+    empty.hidden = Boolean((history || []).length);
+    persist();
   }
 
   function appendCommandCard(title, rows) {
@@ -797,6 +827,16 @@
   document.getElementById("new-chat").addEventListener("click", function () {
     vscode.postMessage({ type: "newChat" });
   });
+  document.getElementById("sessions-toggle").addEventListener("click", function () {
+    sessionPanel.hidden = !sessionPanel.hidden;
+    document.getElementById("sessions-toggle").setAttribute("aria-expanded", sessionPanel.hidden ? "false" : "true");
+    if (!sessionPanel.hidden) vscode.postMessage({ type: "listSessions" });
+  });
+  document.getElementById("session-new").addEventListener("click", function () {
+    sessionPanel.hidden = true;
+    document.getElementById("sessions-toggle").setAttribute("aria-expanded", "false");
+    vscode.postMessage({ type: "newChat" });
+  });
   document.getElementById("terminal").addEventListener("click", function () {
     vscode.postMessage({ type: "openTerminal" });
   });
@@ -843,6 +883,11 @@
     var data = event.data;
     switch (data.type) {
       case "restore":
+        if (Array.isArray(data.history)) renderConversation(data.history, data.sessionId);
+        else currentSessionId = data.sessionId || currentSessionId;
+        sessionName.textContent = data.sessionId ? shortSessionId(data.sessionId) : "New conversation";
+        sessionPanel.hidden = true;
+        document.getElementById("sessions-toggle").setAttribute("aria-expanded", "false");
         setSelection(data.selection);
         applyOptions(data);
         renderRuntimeState(data.runtimeState);
@@ -992,7 +1037,12 @@
         appendCommandCard(data.title || "Info", data.rows || []);
         break;
       case "sessions":
-        renderSessionList(data.sessions || [], data.currentSessionId);
+        renderSessionList(data.sessions || [], data.currentSessionId, data.open);
+        break;
+      case "sessionSwitchFailed":
+        sessionStatus.textContent = "Ready";
+        sessionPanel.hidden = false;
+        document.getElementById("sessions-toggle").setAttribute("aria-expanded", "true");
         break;
       case "tasks":
         renderTasks(data.tasks || [], data.maxConcurrent, data.enabled, data.defaultIsolation, data.autoCommit);
@@ -1004,62 +1054,61 @@
         effortSelect.focus();
         break;
       case "cleared":
-        activeTurnId = undefined;
-        closedTurnIds.clear();
+        currentSessionId = undefined;
         submitting = false;
         pendingDraft = "";
         document.getElementById("send").disabled = false;
-        liveBubble = undefined;
-        messages.querySelectorAll(":scope > :not(#empty)").forEach(function (node) {
-          node.remove();
-        });
-        empty.hidden = false;
+        clearConversation();
+        sessionName.textContent = "New conversation";
         setSelection("");
         renderAttachments([]);
-        vscode.setState({ messages: [] });
+        vscode.setState({ sessionId: undefined, messages: [] });
         prompt.focus();
         break;
     }
   });
 
-  function renderSessionList(sessions, currentSessionId) {
-    var existing = document.getElementById("session-picker");
-    if (existing) {
-      existing.remove();
+  function renderSessionList(sessions, activeSessionId, open) {
+    currentSessionId = activeSessionId || undefined;
+    sessionList.replaceChildren();
+    var activeSession = (sessions || []).find(function (session) { return session.session_id === currentSessionId; });
+    sessionName.textContent = activeSession ? (activeSession.title || shortSessionId(activeSession.session_id)) : "New conversation";
+    if (open) {
+      sessionPanel.hidden = false;
+      document.getElementById("sessions-toggle").setAttribute("aria-expanded", "true");
     }
-    var container = document.createElement("div");
-    container.id = "session-picker";
-    container.className = "session-list";
-    var title = document.createElement("div");
-    title.className = "command-title";
-    title.textContent = "Sessions";
-    container.append(title);
+    if (!(sessions || []).length) {
+      var emptySessions = document.createElement("div");
+      emptySessions.className = "session-empty";
+      emptySessions.textContent = "No conversations yet.";
+      sessionList.append(emptySessions);
+      return;
+    }
     (sessions || []).forEach(function (session) {
-      var item = document.createElement("button");
+      var item = document.createElement("div");
       item.className = "session-item" + (session.session_id === currentSessionId ? " active" : "");
-      item.type = "button";
-      var main = document.createElement("div");
+      item.dataset.sessionId = session.session_id;
+      var main = document.createElement("button");
       main.className = "session-main";
+      main.type = "button";
       var name = document.createElement("div");
       name.className = "session-title";
-      name.textContent = session.title || session.session_id;
+      name.textContent = session.title || shortSessionId(session.session_id);
       var meta = document.createElement("div");
       meta.className = "session-meta";
       meta.textContent = [session.working_dir || "", session.status || ""].filter(Boolean).join(" · ");
       main.append(name, meta);
+      main.addEventListener("click", function () {
+        if (session.session_id === currentSessionId) {
+          sessionPanel.hidden = true;
+          document.getElementById("sessions-toggle").setAttribute("aria-expanded", "false");
+          return;
+        }
+        sessionStatus.textContent = "Switching…";
+        vscode.postMessage({ type: "attachSession", sessionId: session.session_id });
+      });
       var actions = document.createElement("div");
       actions.className = "session-actions";
-      if (session.session_id !== currentSessionId) {
-        var open = document.createElement("button");
-        open.className = "icon-btn";
-        open.title = "Attach to this session";
-        open.innerHTML = '<svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
-        open.addEventListener("click", function (event) {
-          event.stopPropagation();
-          vscode.postMessage({ type: "attachSession", sessionId: session.session_id });
-        });
-        actions.append(open);
-      }
       var rename = document.createElement("button");
       rename.className = "icon-btn";
       rename.title = "Rename";
@@ -1073,10 +1122,13 @@
       });
       actions.append(rename);
       item.append(main, actions);
-      container.append(item);
+      sessionList.append(item);
     });
-    messages.append(container);
-    messages.scrollTop = messages.scrollHeight;
+  }
+
+  function shortSessionId(sessionId) {
+    var value = String(sessionId || "");
+    return value.length > 18 ? value.slice(0, 8) + "…" + value.slice(-6) : value;
   }
 
   document.getElementById("tasks-toggle").addEventListener("click", function () {

@@ -53,6 +53,7 @@ def emit(conn, frame):
 def send_message(conn, frame):
     sid = frame["session_id"]
     content = frame["content"]
+    state["sessions"][sid].setdefault("history", []).append({"role": "user", "content": content})
     emit(conn, {"v": 1, "ev": "message_accepted", "session_id": sid})
     if "WAIT_FOR_CANCEL" in content:
         state.setdefault("pending", {})[sid] = conn
@@ -71,6 +72,7 @@ def send_message(conn, frame):
         emit(conn, {"v": 1, "ev": "tool_done", "session_id": sid, "call_id": "todo-1", "name": "todo", "output": "ok"})
         emit(conn, {"v": 1, "ev": "token_usage", "session_id": sid, "input": 250, "output": 100, "cache_read_input": 750})
     text = "FAKE_CHAT_RESPONSE: " + content[:80]
+    state["sessions"][sid].setdefault("history", []).append({"role": "assistant", "content": text})
     emit(conn, {"v": 1, "ev": "text_delta", "session_id": sid, "text": text})
     emit(conn, {"v": 1, "ev": "turn_done", "session_id": sid})
 
@@ -85,7 +87,7 @@ def handle(conn, frame):
     elif req == "create_session":
         sid = "fake-session-%d" % state["next_session"]
         state["next_session"] += 1
-        state["sessions"][sid] = {"working_dir": frame.get("working_dir")}
+        state["sessions"][sid] = {"working_dir": frame.get("working_dir"), "title": "", "history": []}
         reply("attached", session={"session_id": sid, "working_dir": frame.get("working_dir"), "status": "idle"})
     elif req == "attach_session":
         sid = frame["session_id"]
@@ -96,12 +98,16 @@ def handle(conn, frame):
     elif req == "detach_session":
         reply("ok")
     elif req == "rename_session":
+        state["sessions"][frame["session_id"]]["title"] = frame.get("title", "")
         reply("ok")
     elif req == "list_sessions":
         reply("sessions", sessions=[
-            {"session_id": sid, "working_dir": item.get("working_dir"), "status": "idle"}
+            {"session_id": sid, "working_dir": item.get("working_dir"), "title": item.get("title"), "status": "idle"}
             for sid, item in state["sessions"].items()
         ])
+    elif req == "get_history":
+        sid = frame["session_id"]
+        reply("history", session_id=sid, messages=state["sessions"].get(sid, {}).get("history", []))
     elif req == "list_models":
         reply("models", session_id=frame["session_id"], models=MODELS, current=state["current"])
     elif req == "get_runtime_info":
@@ -248,6 +254,8 @@ async function run() {
     "jcode._test.sendChat",
     "jcode._test.addPastedImage",
     "jcode._test.newChat",
+    "jcode._test.listSessions",
+    "jcode._test.attachSession",
     "jcode._test.cancelChat",
     "jcode._test.setModel",
     "jcode._test.setEffort",
@@ -552,7 +560,13 @@ async function run() {
   assert.equal((await readBridgeFrames(bridgeLog)).length, framesBeforeNoop);
   await updateSetting("maxSelectionCharacters", 200000);
 
+  await vscode.commands.executeCommand("jcode._test.useMockView");
   await vscode.commands.executeCommand("jcode._test.newChat");
+  assert.equal(
+    (await vscode.commands.executeCommand("jcode._test.getChatState")).sessionId,
+    "fake-session-2",
+    "New Chat must create and activate a distinct session before the next message",
+  );
   await vscode.commands.executeCommand(
     "jcode._test.sendChat",
     "A fresh conversation.",
@@ -562,6 +576,73 @@ async function run() {
   const freshSession = frames.filter((frame) => frame.req === "create_session");
   assert.equal(freshSession.length, 2, "New Chat must create a second session");
   assert.equal(freshSession[1].id !== undefined, true);
+
+  assert.equal(await vscode.commands.executeCommand("jcode._test.attachSession", "fake-session-1"), true);
+  assert.equal((await vscode.commands.executeCommand("jcode._test.getChatState")).sessionId, "fake-session-1");
+  const firstSessionRestore = await waitFor(async () => {
+    const posted = await vscode.commands.executeCommand("jcode._test.getPostedMessages");
+    return posted
+      .filter((message) => message.type === "restore" && message.sessionId === "fake-session-1")
+      .at(-1);
+  }, "selected first session transcript to reach the Webview");
+  assert.ok(firstSessionRestore, "switching must publish the selected session transcript");
+  assert.ok(firstSessionRestore.history.some((message) => message.content.includes("First sidebar message.")));
+  assert.equal(firstSessionRestore.history.some((message) => message.content.includes("A fresh conversation.")), false);
+  const resumedFirst = await vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "Continue the first conversation.",
+    false,
+  );
+  assert.equal(resumedFirst.session_id, "fake-session-1");
+
+  assert.equal(await vscode.commands.executeCommand("jcode._test.attachSession", "fake-session-2"), true);
+  const secondSessionRestore = await waitFor(async () => {
+    const posted = await vscode.commands.executeCommand("jcode._test.getPostedMessages");
+    return posted
+      .filter((message) => message.type === "restore" && message.sessionId === "fake-session-2")
+      .at(-1);
+  }, "selected second session transcript to reach the Webview");
+  assert.ok(secondSessionRestore.history.some((message) => message.content.includes("A fresh conversation.")));
+  assert.equal(secondSessionRestore.history.some((message) => message.content.includes("Continue the first conversation.")), false);
+  await vscode.commands.executeCommand("jcode._test.listSessions");
+  const sessionListMessage = await waitFor(async () => {
+    const posted = await vscode.commands.executeCommand("jcode._test.getPostedMessages");
+    return posted.filter((message) => message.type === "sessions" && message.open).at(-1);
+  }, "session switcher state to reach the Webview");
+  assert.equal(sessionListMessage.currentSessionId, "fake-session-2");
+  assert.deepEqual(sessionListMessage.sessions.map((session) => session.session_id), ["fake-session-1", "fake-session-2"]);
+
+  const framesBeforeCompetingSwitches = (await readBridgeFrames(bridgeLog)).length;
+  const competingSwitches = await Promise.all([
+    vscode.commands.executeCommand("jcode._test.attachSession", "fake-session-1"),
+    vscode.commands.executeCommand("jcode._test.attachSession", "fake-session-2"),
+  ]);
+  assert.deepEqual(competingSwitches, [true, true]);
+  assert.equal(
+    (await vscode.commands.executeCommand("jcode._test.getChatState")).sessionId,
+    "fake-session-2",
+    "competing switches must finish in request order without mixing session state",
+  );
+  const restoreAfterCompetingSwitches = (await vscode.commands.executeCommand("jcode._test.getPostedMessages"))
+    .filter((message) => message.type === "restore")
+    .at(-1);
+  assert.equal(restoreAfterCompetingSwitches.sessionId, "fake-session-2");
+  assert.ok(restoreAfterCompetingSwitches.history.some((message) => message.content.includes("A fresh conversation.")));
+  const competingFrames = (await readBridgeFrames(bridgeLog)).slice(framesBeforeCompetingSwitches);
+  const firstAttachIndex = competingFrames.findIndex(
+    (frame) => frame.req === "attach_session" && frame.session_id === "fake-session-1",
+  );
+  const firstHistoryIndex = competingFrames.findIndex(
+    (frame) => frame.req === "get_history" && frame.session_id === "fake-session-1",
+  );
+  const secondAttachIndex = competingFrames.findIndex(
+    (frame) => frame.req === "attach_session" && frame.session_id === "fake-session-2",
+  );
+  assert.ok(firstAttachIndex >= 0 && firstHistoryIndex > firstAttachIndex);
+  assert.ok(
+    secondAttachIndex > firstHistoryIndex,
+    "the second attach must not cross the first session's restore boundary",
+  );
 
   await vscode.commands.executeCommand("jcode._test.setModel", "");
   await vscode.commands.executeCommand("jcode._test.setEffort", "");
@@ -610,6 +691,56 @@ async function run() {
 
   await updateSetting("executablePath", fakeJcode);
   await updateSetting("launchArguments", []);
+  const sessionBeforeRunningNewChat = (await vscode.commands.executeCommand("jcode._test.getChatState")).sessionId;
+  const runningBeforeNewChat = vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "WAIT_FOR_CANCEL BEFORE_NEW_CHAT",
+    false,
+  );
+  await waitFor(async () => {
+    const current = await readBridgeFrames(bridgeLog);
+    return current.some((frame) => frame.req === "send_message" && frame.content.startsWith("WAIT_FOR_CANCEL BEFORE_NEW_CHAT"));
+  }, "message running before New Chat to reach the bridge");
+  await vscode.commands.executeCommand("jcode._test.newChat");
+  assert.equal(await runningBeforeNewChat, undefined);
+  const sessionAfterRunningNewChat = (await vscode.commands.executeCommand("jcode._test.getChatState")).sessionId;
+  assert.notEqual(sessionAfterRunningNewChat, sessionBeforeRunningNewChat);
+  assert.ok(
+    (await readBridgeFrames(bridgeLog)).some(
+      (frame) => frame.req === "cancel" && frame.session_id === sessionBeforeRunningNewChat,
+    ),
+    "New Chat must cancel and settle the old turn before replacing its session",
+  );
+  const afterRunningNewChat = await vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "Fresh session after running New Chat.",
+    false,
+  );
+  assert.equal(afterRunningNewChat.session_id, sessionAfterRunningNewChat);
+
+  const sessionBeforeSyntheticNewChat = sessionAfterRunningNewChat;
+  const syntheticBeforeNewChat = vscode.commands.executeCommand(
+    "jcode._test.sendChat",
+    "/btw WAIT_FOR_CANCEL SYNTHETIC_NEW_CHAT",
+    false,
+  );
+  await waitFor(async () => {
+    const current = await readBridgeFrames(bridgeLog);
+    return current.some(
+      (frame) => frame.req === "send_message" && frame.content.includes("WAIT_FOR_CANCEL SYNTHETIC_NEW_CHAT"),
+    );
+  }, "synthetic prompt turn running before New Chat to reach the bridge");
+  await vscode.commands.executeCommand("jcode._test.newChat");
+  assert.equal(await syntheticBeforeNewChat, undefined);
+  const sessionAfterSyntheticNewChat = (await vscode.commands.executeCommand("jcode._test.getChatState")).sessionId;
+  assert.notEqual(sessionAfterSyntheticNewChat, sessionBeforeSyntheticNewChat);
+  assert.ok(
+    (await readBridgeFrames(bridgeLog)).some(
+      (frame) => frame.req === "cancel" && frame.session_id === sessionBeforeSyntheticNewChat,
+    ),
+    "New Chat must settle a synthetic prompt turn before replacing its session",
+  );
+
   const cancellation = vscode.commands.executeCommand(
     "jcode._test.sendChat",
     "WAIT_FOR_CANCEL",
@@ -617,7 +748,7 @@ async function run() {
   );
   await waitFor(async () => {
     const current = await readBridgeFrames(bridgeLog);
-    return current.some((frame) => frame.req === "send_message" && frame.content.startsWith("WAIT_FOR_CANCEL"));
+    return current.some((frame) => frame.req === "send_message" && frame.content.startsWith("WAIT_FOR_CANCEL VS Code context:"));
   }, "cancellable message to be sent");
   const sendCountDuringTurn = (await readBridgeFrames(bridgeLog)).filter((frame) => frame.req === "send_message").length;
   const steering = await vscode.commands.executeCommand(
