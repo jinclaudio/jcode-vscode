@@ -1,18 +1,9 @@
-# Publish a new extension release.
+# Build a release .vsix and attach it to the GitHub Release.
 #
 # Triggers when a GitHub Release is published (the tag becomes the release
-# version). Builds the .vsix, publishes it to the VS Code Marketplace (and
-# Open VSX when OVSX_PAT is set), then attaches the .vsix to the Release.
-#
-# Required secret:
-#   VSCE_PAT - Marketplace publisher token for publisher "claudioj".
-#     Create it at https://marketplace.visualstudio.com/manage/publishers
-#     (Details -> Personal Access Token -> "Create a personal access token"),
-#     then add it to Settings -> Secrets and variables -> Actions as VSCE_PAT.
-#
-# Optional secret:
-#   OVSX_PAT - Open VSX token (https://open-vsx.org/user-settings/tokens).
-#     When set, the extension is also published to Open VSX.
+# version). Builds the .vsix and attaches it to the Release so it can be
+# downloaded and published manually (see publish.yml for the manual publish
+# workflow).
 #
 # Before releasing: bump "version" in package.json to the new version and
 # create a Release with tag v<version>. The workflow verifies they match.
@@ -62,26 +53,6 @@ jobs:
 
       - name: Package vsix
         run: npx @vscode/vsce package --out "jcode-vscode-${{ github.ref_name }}.vsix"
-
-      - name: Publish to VS Code Marketplace
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
-        run: |
-          if [ -z "$VSCE_PAT" ]; then
-            echo "::error::VSCE_PAT secret is not set. Add your Marketplace publisher token for publisher 'claudioj' as a repository secret named VSCE_PAT."
-            exit 1
-          fi
-          npx @vscode/vsce publish --packagePath "jcode-vscode-${{ github.ref_name }}.vsix"
-
-      - name: Publish to Open VSX
-        env:
-          OVSX_PAT: ${{ secrets.OVSX_PAT }}
-        run: |
-          if [ -n "$OVSX_PAT" ]; then
-            npx --yes ovsx publish "jcode-vscode-${{ github.ref_name }}.vsix" -p "$OVSX_PAT"
-          else
-            echo "OVSX_PAT not set, skipping Open VSX publish"
-          fi
 
       - name: Attach vsix to GitHub release
         if: github.event_name == 'release'
