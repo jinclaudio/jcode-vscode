@@ -33,6 +33,13 @@
   var todoCount = document.getElementById("todo-count");
   var todoSummary = document.getElementById("todo-summary");
   var todoList = document.getElementById("todo-list");
+  var taskPanel = document.getElementById("task-panel");
+  var taskForm = document.getElementById("task-form");
+  var taskList = document.getElementById("task-list");
+  var tasks = [];
+  var maxConcurrent = 3;
+  var taskDefaultMode = "worktree";
+  var taskDefaultAutoCommit = true;
 
   var saved = vscode.getState() || { messages: [] };
   var liveBubble;
@@ -512,6 +519,104 @@
     sessionStatus.classList.remove("error");
   }
 
+  function taskAction(label, type, taskId) {
+    var button = document.createElement("button");
+    button.className = "small-btn";
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", function () {
+      vscode.postMessage({ type: type, taskId: taskId });
+    });
+    return button;
+  }
+
+  function renderTasks(items, concurrent, enabled, defaultIsolation, autoCommit) {
+    tasks = Array.isArray(items) ? items : [];
+    maxConcurrent = concurrent || maxConcurrent;
+    if (["worktree", "shared", "read-only"].includes(defaultIsolation)) taskDefaultMode = defaultIsolation;
+    if (typeof autoCommit === "boolean") taskDefaultAutoCommit = autoCommit;
+    if (taskForm.hidden) {
+      document.getElementById("task-mode").value = taskDefaultMode;
+      document.getElementById("task-auto-commit").checked = taskDefaultAutoCommit;
+    }
+    var taskToggle = document.getElementById("tasks-toggle");
+    taskToggle.hidden = enabled === false;
+    if (enabled === false) taskPanel.hidden = true;
+    taskList.replaceChildren();
+    var active = tasks.filter(function (task) { return task.status === "running"; }).length;
+    var queued = tasks.filter(function (task) { return task.status === "queued" || task.status === "preparing"; }).length;
+    var badge = document.getElementById("task-badge");
+    badge.textContent = active ? String(active) : "";
+    badge.classList.toggle("visible", active > 0);
+    document.getElementById("task-summary").textContent = tasks.length
+      ? active + " running · " + queued + " queued · max " + maxConcurrent
+      : "No tasks";
+    if (!tasks.length) {
+      var emptyTask = document.createElement("div");
+      emptyTask.className = "task-empty";
+      emptyTask.textContent = "Create parallel worker sessions for independent repository tasks.";
+      taskList.append(emptyTask);
+      return;
+    }
+    tasks.forEach(function (task) {
+      var card = document.createElement("article");
+      card.className = "task-card " + task.status;
+      card.dataset.taskId = task.id;
+      var head = document.createElement("div");
+      head.className = "task-card-head";
+      var title = document.createElement("div");
+      title.className = "task-card-title";
+      title.textContent = task.title;
+      title.title = task.title;
+      var status = document.createElement("span");
+      status.className = "task-status";
+      status.textContent = task.status;
+      head.append(title, status);
+      var meta = document.createElement("div");
+      meta.className = "task-card-meta";
+      meta.textContent = [task.kind, task.mode, task.branch, task.model, task.activity].filter(Boolean).join(" · ");
+      var output = document.createElement("div");
+      output.className = "task-card-output" + (task.error ? " task-card-error" : "");
+      output.textContent = String(task.error || task.summary || task.output || task.prompt || "").slice(-600);
+      var actions = document.createElement("div");
+      actions.className = "task-card-actions";
+      if (task.sessionId && task.status !== "running") actions.append(taskAction("Open", "openTask", task.id));
+      if (["running", "queued", "preparing", "detached"].includes(task.status)) {
+        actions.append(taskAction("Cancel", "cancelTask", task.id));
+      }
+      if (task.mode === "worktree") {
+        actions.append(taskAction("Diff", "diffTask", task.id));
+        actions.append(taskAction("Commit", "commitTask", task.id));
+        if (task.status === "completed") actions.append(taskAction("Merge", "mergeTask", task.id));
+      }
+      if (task.status !== "running" && task.status !== "preparing") {
+        actions.append(taskAction("Remove", "removeTask", task.id));
+      }
+      card.append(head, meta, output, actions);
+      taskList.append(card);
+    });
+  }
+
+  function taskFormValue() {
+    return {
+      title: document.getElementById("task-title").value.trim(),
+      prompt: document.getElementById("task-prompt").value.trim(),
+      mode: document.getElementById("task-mode").value,
+      kind: document.getElementById("task-kind").value,
+      dependsOn: document.getElementById("task-dependencies").value,
+      autoCommit: document.getElementById("task-auto-commit").checked,
+      model: selectedModel,
+      effort: effortSelect.value,
+    };
+  }
+
+  function resetTaskForm() {
+    taskForm.reset();
+    document.getElementById("task-mode").value = taskDefaultMode;
+    document.getElementById("task-auto-commit").checked = taskDefaultAutoCommit;
+    taskForm.hidden = true;
+  }
+
   function resizePrompt() {
     prompt.style.height = "auto";
     prompt.style.height = Math.min(prompt.scrollHeight, 200) + "px";
@@ -889,6 +994,12 @@
       case "sessions":
         renderSessionList(data.sessions || [], data.currentSessionId);
         break;
+      case "tasks":
+        renderTasks(data.tasks || [], data.maxConcurrent, data.enabled, data.defaultIsolation, data.autoCommit);
+        break;
+      case "taskError":
+        appendNotice(data.text || "Task operation failed.", true);
+        break;
       case "openEffortPicker":
         effortSelect.focus();
         break;
@@ -967,6 +1078,41 @@
     messages.append(container);
     messages.scrollTop = messages.scrollHeight;
   }
+
+  document.getElementById("tasks-toggle").addEventListener("click", function () {
+    taskPanel.hidden = !taskPanel.hidden;
+  });
+  document.getElementById("new-task").addEventListener("click", function () {
+    taskForm.hidden = !taskForm.hidden;
+    if (!taskForm.hidden) document.getElementById("task-title").focus();
+  });
+  document.getElementById("task-form-cancel").addEventListener("click", resetTaskForm);
+  taskForm.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var task = taskFormValue();
+    if (!task.title || !task.prompt) {
+      appendNotice("Task title and prompt are required.", true);
+      return;
+    }
+    vscode.postMessage({ type: "createTask", task: task });
+    resetTaskForm();
+  });
+  document.getElementById("task-batch-create").addEventListener("click", function () {
+    var mode = document.getElementById("task-mode").value;
+    var autoCommit = document.getElementById("task-auto-commit").checked;
+    var items = document.getElementById("task-batch").value.split("\n").map(function (line) {
+      var parts = line.split("::");
+      var title = (parts.shift() || "").trim();
+      var taskPrompt = parts.join("::").trim();
+      return title && taskPrompt ? { title: title, prompt: taskPrompt, mode: mode, autoCommit: autoCommit, model: selectedModel, effort: effortSelect.value } : undefined;
+    }).filter(Boolean);
+    if (!items.length) {
+      appendNotice("Use one batch task per line: Title :: prompt", true);
+      return;
+    }
+    vscode.postMessage({ type: "createTaskBatch", tasks: items });
+    resetTaskForm();
+  });
 
   vscode.postMessage({ type: "ready", hasHistory: Boolean((saved.messages || []).length) });
 })();

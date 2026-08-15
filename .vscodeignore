@@ -16,7 +16,9 @@ bun.lock
 test/**
 scripts/**
 .vscode/**
+.code-review-graph/**
 .git/**
 package-lock.json
+PLAN.md
 .gitignore
 

@@ -19,6 +19,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const { spawn } = require("node:child_process");
 const vscode = require("vscode");
+const { MultiSessionTaskManager } = require("./task-manager");
 
 const TERMINAL_NAME = "Jcode";
 const CHAT_VIEW_ID = "jcode.chatView";
@@ -52,7 +53,7 @@ const DEFAULT_MODELS = [
   "qwen3.6-plus",
   "minimax-m3",
 ];
-const CLIENT_NAME = "jcode-vscode/0.9.2";
+const CLIENT_NAME = "jcode-vscode/0.10.0";
 const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -273,6 +274,21 @@ async function getJcodeClient() {
   }
 }
 
+/** Create a dedicated SDK connection for one concurrent task run. */
+async function createJcodeTaskClient() {
+  // Ensure the shared bridge exists before opening an additional connection.
+  await getJcodeClient();
+  const { JcodeClient } = await getSdk();
+  const apiSocket = getApiSocketPath();
+  const client = await withTimeout(
+    JcodeClient.connect({ clientName: `${CLIENT_NAME}/task`, socketPath: apiSocket }),
+    5000,
+    "dialing a parallel task connection",
+  );
+  log("connected dedicated parallel task client");
+  return client;
+}
+
 async function connectWithBridge() {
   const { JcodeClient } = await getSdk();
   const apiSocket = getApiSocketPath();
@@ -484,6 +500,30 @@ function activate(context) {
         effort: chatProvider.getSelectedEffort(),
         attachmentCount: chatProvider.attachments.size,
       })),
+      vscode.commands.registerCommand("jcode._test.createTask", (task) =>
+        chatProvider.taskManager.createTask(task),
+      ),
+      vscode.commands.registerCommand("jcode._test.createTasks", (tasks) =>
+        chatProvider.taskManager.createBatch(tasks),
+      ),
+      vscode.commands.registerCommand("jcode._test.getTasks", () =>
+        chatProvider.taskManager.snapshot(),
+      ),
+      vscode.commands.registerCommand("jcode._test.cancelTask", (taskId) =>
+        chatProvider.taskManager.cancelTask(taskId),
+      ),
+      vscode.commands.registerCommand("jcode._test.diffTask", (taskId) =>
+        chatProvider.taskManager.showDiff(taskId),
+      ),
+      vscode.commands.registerCommand("jcode._test.commitTask", (taskId) =>
+        chatProvider.taskManager.commitTask(taskId, false),
+      ),
+      vscode.commands.registerCommand("jcode._test.mergeTask", (taskId) =>
+        chatProvider.taskManager.mergeTask(taskId),
+      ),
+      vscode.commands.registerCommand("jcode._test.removeTask", (taskId, force = false) =>
+        chatProvider.taskManager.removeTask(taskId, force),
+      ),
       vscode.commands.registerCommand("jcode._test.closeClient", async () => {
         const client = currentClient;
         currentClient = undefined;
@@ -765,6 +805,15 @@ class JcodeChatProvider {
     this.attachments = new Map();
     this.nextAttachmentId = 1;
     this.testPostedMessages = undefined;
+    this.taskManager = new MultiSessionTaskManager({
+      context,
+      getClient: getJcodeClient,
+      createClient: createJcodeTaskClient,
+      post: (message) => this.post(message),
+      getWorkspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || getWorkingDirectory(getCurrentTextEditor()),
+      log,
+      openSession: (sessionId) => this.attachToSession(sessionId),
+    });
   }
 
   resolveWebviewView(webviewView) {
@@ -784,6 +833,7 @@ class JcodeChatProvider {
             await this.context.workspaceState.update(CHAT_SESSION_KEY, undefined);
           }
           this.postBootstrap();
+          await this.taskManager.initialize();
           log("bootstrap posted");
           void this.restoreChat();
           break;
@@ -827,6 +877,30 @@ class JcodeChatProvider {
         case "renameSession":
           await this.renameCurrentSession(message.sessionId, message.title);
           break;
+        case "createTask":
+          await this.handleTaskAction("create task", () => this.taskManager.createTask(message.task));
+          break;
+        case "createTaskBatch":
+          await this.handleTaskAction("create tasks", () => this.taskManager.createBatch(message.tasks));
+          break;
+        case "cancelTask":
+          await this.handleTaskAction("cancel task", () => this.taskManager.cancelTask(message.taskId));
+          break;
+        case "openTask":
+          await this.handleTaskAction("open task session", () => this.taskManager.openTask(message.taskId));
+          break;
+        case "diffTask":
+          await this.handleTaskAction("show task diff", () => this.taskManager.showDiff(message.taskId));
+          break;
+        case "commitTask":
+          await this.handleTaskAction("commit task", () => this.taskManager.commitTask(message.taskId));
+          break;
+        case "mergeTask":
+          await this.confirmAndMergeTask(message.taskId);
+          break;
+        case "removeTask":
+          await this.confirmAndRemoveTask(message.taskId);
+          break;
         case "webviewError":
           log(`webview error: ${message.message}`);
           break;
@@ -844,6 +918,43 @@ class JcodeChatProvider {
 
   async focus() {
     await vscode.commands.executeCommand(`${CHAT_VIEW_ID}.focus`);
+  }
+
+  async handleTaskAction(label, action) {
+    try {
+      return await action();
+    } catch (error) {
+      const message = errorMessage(error);
+      this.post({ type: "taskError", text: message });
+      void vscode.window.showErrorMessage(`Could not ${label}: ${message}`);
+      return undefined;
+    }
+  }
+
+  async confirmAndMergeTask(taskId) {
+    const task = this.taskManager.getTask(taskId);
+    if (!task) return;
+    const choice = await vscode.window.showWarningMessage(
+      `Cherry-pick the commits from ${task.title} into the main worktree?`,
+      { modal: true },
+      "Merge Task",
+    );
+    if (choice === "Merge Task") {
+      await this.handleTaskAction("merge task", () => this.taskManager.mergeTask(taskId));
+    }
+  }
+
+  async confirmAndRemoveTask(taskId) {
+    const task = this.taskManager.getTask(taskId);
+    if (!task) return;
+    const choice = await vscode.window.showWarningMessage(
+      `Remove task ${task.title}${task.mode === "worktree" ? " and its worktree" : ""}?`,
+      { modal: true },
+      "Remove",
+    );
+    if (choice === "Remove") {
+      await this.handleTaskAction("remove task", () => this.taskManager.removeTask(taskId));
+    }
   }
 
   getModelList() {
@@ -1900,6 +2011,7 @@ class JcodeChatProvider {
 
   dispose() {
     this.disposed = true;
+    this.taskManager.dispose();
   }
 }
 
@@ -2125,10 +2237,30 @@ function getChatHtml(webview, context) {
     <header class="topbar">
       <div class="brand"><span class="brand-mark">J</span><span class="brand-copy"><span class="title">Jcode</span><small id="session-status">Connecting…</small></span></div>
       <div class="top-actions">
+        <button id="tasks-toggle" class="icon-btn task-toggle" title="Parallel tasks" aria-label="Parallel tasks"><svg viewBox="0 0 24 24"><path d="M4 6h6M4 12h10M4 18h8M17 5v6M14 8h6"/></svg><span id="task-badge" class="task-badge"></span></button>
         <button id="terminal" class="icon-btn" title="Open terminal agent" aria-label="Open terminal agent"><svg viewBox="0 0 24 24"><path d="m5 7 4 4-4 4M11 17h7"/></svg></button>
         <button id="new-chat" class="icon-btn" title="New chat" aria-label="New chat"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
       </div>
     </header>
+    <aside id="task-panel" class="task-panel" hidden>
+      <div class="task-panel-header">
+        <div><strong>Parallel tasks</strong><small id="task-summary">No tasks</small></div>
+        <button id="new-task" class="small-btn" type="button">+ Task</button>
+      </div>
+      <form id="task-form" class="task-form" hidden>
+        <input id="task-title" type="text" maxlength="120" placeholder="Task title" aria-label="Task title">
+        <textarea id="task-prompt" rows="4" placeholder="Describe the task and its acceptance criteria" aria-label="Task prompt"></textarea>
+        <div class="task-form-row">
+          <select id="task-mode" aria-label="Task isolation"><option value="worktree">Worktree</option><option value="read-only">Read only</option><option value="shared">Shared workspace</option></select>
+          <select id="task-kind" aria-label="Task kind"><option value="task">Worker</option><option value="coordinator">Coordinator</option></select>
+        </div>
+        <input id="task-dependencies" type="text" placeholder="Dependencies: task title or id, comma separated" aria-label="Task dependencies">
+        <label class="task-check"><input id="task-auto-commit" type="checkbox" checked> Auto commit worktree changes</label>
+        <div class="task-form-actions"><button id="task-form-cancel" class="small-btn" type="button">Cancel</button><button class="small-btn primary" type="submit">Create task</button></div>
+        <details class="batch-create"><summary>Batch create</summary><textarea id="task-batch" rows="4" placeholder="One per line: Title :: prompt"></textarea><button id="task-batch-create" class="small-btn" type="button">Create batch</button></details>
+      </form>
+      <div id="task-list" class="task-list"></div>
+    </aside>
     <section id="messages" class="messages" aria-live="polite">
       <div id="empty" class="welcome">
         <div class="welcome-mark">✦</div>

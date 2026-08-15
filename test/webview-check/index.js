@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const vscode = require("vscode");
 
-const EXTENSION_ID = "jcode.jcode-vscode";
+const EXTENSION_ID = "claudioj.jcode-vscode";
 const VIEW_ID = "jcode.chatView";
 
 function sleep(ms) {

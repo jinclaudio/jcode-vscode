@@ -16,6 +16,15 @@ commands for asking, explaining, and fixing code.
   full Jcode TUI in the current workspace.
 - The Chat page supports multi-turn sessions, New Chat, cancellation, live streaming
   replies, workspace prompts, and an optional current-selection attachment.
+- The Parallel tasks dashboard runs multiple Jcode sessions at once. Each worker has
+  its own prompt, status, output, model, effort, and cancellation control. A bounded
+  queue enforces `jcode.multiSession.maxConcurrent`, dependencies delay downstream
+  work, and read-only coordinator tasks synthesize completed worker results.
+- Editable tasks default to isolated Git worktrees and `jcode/<task>` branches. The
+  dashboard can show each task diff, commit isolated changes, cherry-pick completed
+  commits into a clean main worktree, abort conflicts safely, and remove worktrees.
+  Shared-workspace and read-only modes are also available for tasks that do not need
+  branch isolation.
 - The composer supports file and image attachments, removable attachment chips, and
   direct clipboard image paste. Images use the SDK's native attachment field; other
   files are shared as exact local paths for Jcode to read.
@@ -97,6 +106,10 @@ npm run package
   streaming replies, model and reasoning-effort switching, native slash-command
   routing (including in-flight `/cancel` and literal slash escaping), image
   attachments, and cancellation (against a fake bridge that speaks the SDK protocol);
+- parallel task sessions: concurrent execution, distinct session IDs, independent
+  cancellation, queue limits, dependency ordering, and coordinator synthesis;
+- Git integration in a temporary real repository: worktree creation, branch isolation,
+  commit, clean-main cherry-pick, merged file observation, and worktree cleanup;
 - active editor and multiple selection capture, including unsaved text;
 - exact selection ranges and temporary context-file contents;
 - Chat and terminal working directories and configured Jcode arguments;
@@ -133,6 +146,12 @@ If the chat stays on "Connecting…" or a message fails to send:
 - `jcode.executablePath`: absolute path or command name for Jcode.
 - `jcode.launchArguments`: extra arguments such as `--provider` and a provider name.
 - `jcode.maxSelectionCharacters`: safety limit for selection snapshots.
+- `jcode.multiSession.enabled`: show and enable the Parallel tasks dashboard.
+- `jcode.multiSession.maxConcurrent`: maximum task sessions running at once, from 1 to 12.
+- `jcode.multiSession.defaultIsolation`: default new-task mode, `worktree`, `shared`, or
+  `read-only`.
+- `jcode.multiSession.autoCommit`: automatically commit successful worktree tasks on
+  their isolated branch.
 - `jcode.defaultModel`: default model applied to new Jcode chat sessions and the
   terminal agent, e.g. `deepseek-v4-pro`. The sidebar chat model picker overrides
   this per workspace.
@@ -169,9 +188,16 @@ Example `settings.json`:
 
 The sidebar chats with Jcode over the stable harness API (protocol v1) through the
 official TypeScript SDK. The extension connects to the user's `jcode api-bridge`
-(autostarting it if needed), creates or resumes a per-workspace session, lists the
-real model catalog for the picker, streams `text_delta` events into the Chat page,
-sends image attachments through `run(..., { images })`, and maps supported slash
-commands to SDK methods such as `setModel`, `setReasoningEffort`, `clear`, `compact`,
-and `renameSession`. The terminal agent uses the public `jcode` CLI so it gets the
-full interactive TUI command surface.
+(autostarting it if needed), creates or resumes the primary per-workspace chat session,
+and gives every parallel task its own SDK session and working directory. A persisted
+`MultiSessionTaskManager` schedules bounded concurrent workers, resolves dependencies,
+restores detached task metadata, and publishes task state to the Webview.
+
+Editable workers use Git worktrees under extension global storage. Diff and commit run
+inside the isolated worktree, while merge verifies that the main worktree is clean and
+cherry-picks the task branch commits, aborting conflicts. The extension lists the real
+model catalog for the picker, streams `text_delta` events into the Chat page, sends image
+attachments through `run(..., { images })`, and maps supported slash commands to SDK
+methods such as `setModel`, `setReasoningEffort`, `clear`, `compact`, and
+`renameSession`. The terminal agent uses the public `jcode` CLI so it gets the full
+interactive TUI command surface.

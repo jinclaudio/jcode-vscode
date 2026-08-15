@@ -63,6 +63,81 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 }
 .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
 .icon-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.task-toggle { position: relative; }
+.task-badge {
+  display: none;
+  position: absolute;
+  top: 1px; right: 1px;
+  min-width: 12px; height: 12px;
+  padding: 0 3px;
+  border-radius: 7px;
+  color: var(--vscode-badge-foreground);
+  background: var(--vscode-badge-background);
+  font-size: 8px; line-height: 12px;
+}
+.task-badge.visible { display: block; }
+
+/* Parallel task dashboard */
+.task-panel {
+  flex: 0 1 48%;
+  min-height: 150px;
+  max-height: 58vh;
+  overflow-y: auto;
+  padding: 10px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: color-mix(in srgb, var(--vscode-sideBar-background) 82%, var(--vscode-editorWidget-background));
+}
+.task-panel-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.task-panel-header > div { display: flex; flex-direction: column; min-width: 0; }
+.task-panel-header strong { font-size: 12px; }
+.task-panel-header small { color: var(--vscode-descriptionForeground); font-size: 9px; }
+.task-form {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 10px;
+  padding: 9px;
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 9px;
+  background: var(--vscode-editorWidget-background);
+}
+.task-form input[type="text"], .task-form textarea, .task-form select {
+  width: 100%;
+  border: 1px solid var(--vscode-input-border, var(--vscode-widget-border));
+  border-radius: 6px;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+}
+.task-form input[type="text"], .task-form select { height: 29px; padding: 0 7px; }
+.task-form textarea { min-height: 66px; resize: vertical; padding: 6px 7px; }
+.task-form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.task-check { display: flex; align-items: center; gap: 6px; color: var(--vscode-descriptionForeground); font-size: 10px; }
+.task-form-actions { display: flex; justify-content: flex-end; gap: 5px; }
+.small-btn.primary { color: #fff; background: var(--accent); }
+.batch-create { color: var(--vscode-descriptionForeground); font-size: 10px; }
+.batch-create summary { cursor: pointer; }
+.batch-create textarea { margin: 6px 0; }
+.task-list { display: grid; gap: 7px; }
+.task-empty { padding: 16px 8px; color: var(--vscode-descriptionForeground); text-align: center; font-size: 10px; }
+.task-card {
+  padding: 8px;
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--vscode-editorWidget-background) 68%, transparent);
+}
+.task-card.running { border-color: color-mix(in srgb, var(--accent) 58%, var(--vscode-widget-border)); }
+.task-card.failed, .task-card.blocked { border-color: color-mix(in srgb, var(--vscode-errorForeground) 55%, var(--vscode-widget-border)); }
+.task-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 7px; }
+.task-card-title { min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-status { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; color: var(--vscode-descriptionForeground); font-size: 9px; text-transform: capitalize; }
+.task-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--vscode-descriptionForeground); }
+.task-card.running .task-status::before { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.task-card.completed .task-status::before, .task-card.merged .task-status::before { background: var(--vscode-testing-iconPassed); }
+.task-card.failed .task-status::before, .task-card.blocked .task-status::before { background: var(--vscode-testing-iconFailed); }
+.task-card-meta { margin-top: 3px; color: var(--vscode-descriptionForeground); font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-card-output { max-height: 72px; margin-top: 6px; overflow: hidden; color: var(--vscode-descriptionForeground); font-size: 10px; white-space: pre-wrap; }
+.task-card-error { color: var(--vscode-errorForeground); }
+.task-card-actions { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 7px; }
+.task-card-actions button { height: 23px; padding: 0 6px; font-size: 9px; }
 
 /* Messages */
 .messages { flex: 1; overflow-y: auto; padding: 14px 12px 24px; scroll-padding-bottom: 24px; }

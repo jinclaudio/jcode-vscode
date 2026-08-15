@@ -2,7 +2,7 @@
   "name": "jcode-vscode",
   "displayName": "Jcode",
   "description": "Full Jcode agent wrapper: sidebar chat, editor context, session management, and slash commands over the official jcode SDK (api-bridge).",
-  "version": "0.9.3",
+  "version": "0.10.0",
   "publisher": "claudioj",
   "license": "MIT",
   "repository": {
@@ -178,6 +178,33 @@
           "default": true,
           "markdownDescription": "Include a compact summary of the active editor, selection, and open files with each sidebar message so the agent knows what you are looking at in VS Code."
         },
+        "jcode.multiSession.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Enable the multi-task dashboard and parallel Jcode sessions."
+        },
+        "jcode.multiSession.maxConcurrent": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 12,
+          "markdownDescription": "Maximum number of Jcode task sessions that may run concurrently. Additional tasks remain queued."
+        },
+        "jcode.multiSession.defaultIsolation": {
+          "type": "string",
+          "enum": [
+            "worktree",
+            "shared",
+            "read-only"
+          ],
+          "default": "worktree",
+          "markdownDescription": "Default workspace mode for new tasks. Worktree creates an isolated Git branch and directory; shared uses the current workspace; read-only instructs the agent not to edit files."
+        },
+        "jcode.multiSession.autoCommit": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Automatically commit completed worktree task changes on their isolated task branch."
+        },
         "jcode.defaultEffort": {
           "type": "string",
           "enum": [
@@ -197,7 +224,7 @@
     }
   },
   "scripts": {
-    "check": "node --check extension.js && node --check media/chat.js",
+    "check": "node --check extension.js && node --check task-manager.js && node --check media/chat.js",
     "check:webview": "node scripts/check-webview.js",
     "test:acceptance": "node scripts/run-acceptance.js",
     "package": "npx @vscode/vsce package"

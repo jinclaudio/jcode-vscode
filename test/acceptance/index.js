@@ -3,9 +3,12 @@ const fs = require("node:fs/promises");
 const fsSync = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
 const vscode = require("vscode");
 
-const EXTENSION_ID = "jcode.jcode-vscode";
+const EXTENSION_ID = "claudioj.jcode-vscode";
+const execFileAsync = promisify(execFile);
 
 const FAKE_BRIDGE_PY = String.raw`#!/usr/bin/env python3
 import json, os, socket, sys, threading, time
@@ -52,7 +55,7 @@ def send_message(conn, frame):
     content = frame["content"]
     emit(conn, {"v": 1, "ev": "message_accepted", "session_id": sid})
     if "WAIT_FOR_CANCEL" in content:
-        state.setdefault("pending", []).append((conn, sid))
+        state.setdefault("pending", {})[sid] = conn
         return
     if "SHOW_METRICS" in content:
         todo_input = json.dumps({"todos": [
@@ -92,6 +95,13 @@ def handle(conn, frame):
             reply("attached", session={"session_id": sid, "working_dir": state["sessions"][sid]["working_dir"], "status": "idle"})
     elif req == "detach_session":
         reply("ok")
+    elif req == "rename_session":
+        reply("ok")
+    elif req == "list_sessions":
+        reply("sessions", sessions=[
+            {"session_id": sid, "working_dir": item.get("working_dir"), "status": "idle"}
+            for sid, item in state["sessions"].items()
+        ])
     elif req == "list_models":
         reply("models", session_id=frame["session_id"], models=MODELS, current=state["current"])
     elif req == "get_runtime_info":
@@ -113,11 +123,10 @@ def handle(conn, frame):
     elif req == "cancel":
         reply("ok")
         sid = frame.get("session_id")
-        pending = state.get("pending", [])
-        state["pending"] = [p for p in pending if p != (conn, sid)]
-        if (conn, sid) in pending:
-            emit(conn, {"v": 1, "ev": "text_delta", "session_id": sid, "text": "FAKE_CHAT_RESPONSE: partial"})
-            emit(conn, {"v": 1, "ev": "turn_done", "session_id": sid})
+        pending_conn = state.get("pending", {}).pop(sid, None)
+        if pending_conn:
+            emit(pending_conn, {"v": 1, "ev": "text_delta", "session_id": sid, "text": "FAKE_CHAT_RESPONSE: partial"})
+            emit(pending_conn, {"v": 1, "ev": "turn_done", "session_id": sid})
     elif req == "clear":
         reply("ok")
     elif req == "ping":
@@ -176,6 +185,11 @@ async function updateSetting(name, value) {
   await vscode.workspace
     .getConfiguration("jcode")
     .update(name, value, vscode.ConfigurationTarget.Global);
+}
+
+async function git(cwd, ...args) {
+  const result = await execFileAsync("git", args, { cwd, encoding: "utf8" });
+  return result.stdout.trim();
 }
 
 async function readInvocations(argsLog) {
@@ -243,6 +257,14 @@ async function run() {
     "jcode._test.useMockView",
     "jcode._test.getPostedMessages",
     "jcode._test.getModelPickerItems",
+    "jcode._test.createTask",
+    "jcode._test.createTasks",
+    "jcode._test.getTasks",
+    "jcode._test.cancelTask",
+    "jcode._test.diffTask",
+    "jcode._test.commitTask",
+    "jcode._test.mergeTask",
+    "jcode._test.removeTask",
   ]) {
     assert.ok(commands.includes(command), `${command} must be registered`);
   }
@@ -631,9 +653,202 @@ async function run() {
   );
   assert.match(afterCancellation.text, /FAKE_CHAT_RESPONSE/);
 
+  await updateSetting("multiSession.enabled", true);
+  await updateSetting("multiSession.maxConcurrent", 2);
+  await updateSetting("multiSession.autoCommit", false);
+
+  const staleTasks = await vscode.commands.executeCommand("jcode._test.getTasks");
+  for (const task of staleTasks) {
+    if (["running", "queued", "preparing", "detached"].includes(task.status)) {
+      await vscode.commands.executeCommand("jcode._test.cancelTask", task.id);
+    }
+    await vscode.commands.executeCommand("jcode._test.removeTask", task.id, true);
+  }
+
+  const parallelTasks = await vscode.commands.executeCommand("jcode._test.createTasks", [
+    { title: "Parallel alpha", prompt: "WAIT_FOR_CANCEL alpha", mode: "read-only" },
+    { title: "Parallel beta", prompt: "WAIT_FOR_CANCEL beta", mode: "read-only" },
+    { title: "Parallel gamma", prompt: "WAIT_FOR_CANCEL gamma", mode: "read-only" },
+  ]);
+  assert.equal(parallelTasks.length, 3);
+  const runningParallel = await waitFor(async () => {
+    const current = await vscode.commands.executeCommand("jcode._test.getTasks");
+    const selected = current.filter((task) => parallelTasks.some((created) => created.id === task.id));
+    const running = selected.filter((task) => task.status === "running" && task.sessionId);
+    const queued = selected.filter((task) => task.status === "queued");
+    return selected.length === 3 && running.length === 2 && queued.length === 1
+      ? selected
+      : undefined;
+  }, "two Jcode task sessions to run concurrently");
+  const initialRunning = runningParallel.filter((task) => task.status === "running");
+  assert.equal(new Set(initialRunning.map((task) => task.sessionId)).size, 2, "parallel tasks must own distinct sessions");
+  const parallelFrames = await readBridgeFrames(bridgeLog);
+  assert.equal(
+    parallelFrames.filter(
+      (frame) => frame.req === "send_message" &&
+        (frame.content.includes("WAIT_FOR_CANCEL alpha") || frame.content.includes("WAIT_FOR_CANCEL beta")),
+    ).length,
+    2,
+    "both parallel task prompts must cross the SDK bridge",
+  );
+  await vscode.commands.executeCommand("jcode._test.cancelTask", parallelTasks[0].id);
+  await waitFor(async () => {
+    const current = await vscode.commands.executeCommand("jcode._test.getTasks");
+    return current.find((task) => task.id === parallelTasks[0].id)?.status === "cancelled";
+  }, "the first parallel task to cancel independently");
+  const afterFirstTaskCancel = await waitFor(async () => {
+    const current = await vscode.commands.executeCommand("jcode._test.getTasks");
+    return current.find((task) => task.id === parallelTasks[2].id)?.status === "running" ? current : undefined;
+  }, "the queued task to start when a worker slot becomes available");
+  assert.equal(afterFirstTaskCancel.find((task) => task.id === parallelTasks[1].id)?.status, "running");
+  await vscode.commands.executeCommand("jcode._test.cancelTask", parallelTasks[1].id);
+  await vscode.commands.executeCommand("jcode._test.cancelTask", parallelTasks[2].id);
+  await waitFor(async () => {
+    const current = await vscode.commands.executeCommand("jcode._test.getTasks");
+    return parallelTasks.slice(1).every((created) => current.find((task) => task.id === created.id)?.status === "cancelled");
+  }, "the remaining parallel tasks to cancel independently");
+
+  const dependencyA = await vscode.commands.executeCommand("jcode._test.createTask", {
+    title: "Dependency A",
+    prompt: "Return dependency A result.",
+    mode: "read-only",
+  });
+  const dependencyB = await vscode.commands.executeCommand("jcode._test.createTask", {
+    title: "Dependency B",
+    prompt: "Return dependency B result.",
+    mode: "read-only",
+  });
+  const coordinator = await vscode.commands.executeCommand("jcode._test.createTask", {
+    title: "Coordinator",
+    prompt: "Synthesize the completed dependency work.",
+    kind: "coordinator",
+    mode: "worktree",
+    dependsOn: [dependencyA.id, dependencyB.id],
+  });
+  assert.equal(coordinator.mode, "read-only", "coordinator tasks must never receive an editable worktree");
+  await waitFor(async () => {
+    const current = await vscode.commands.executeCommand("jcode._test.getTasks");
+    return current.find((task) => task.id === coordinator.id)?.status === "completed";
+  }, "dependency workers and coordinator to complete");
+  const coordinatorFrame = (await readBridgeFrames(bridgeLog)).find(
+    (frame) => frame.req === "send_message" && frame.content.includes('assigned task "Coordinator"'),
+  );
+  assert.ok(coordinatorFrame, "coordinator prompt must cross the SDK bridge");
+  assert.match(coordinatorFrame.content, /Dependency A \(completed\)/);
+  assert.match(coordinatorFrame.content, /Dependency B \(completed\)/);
+  assert.match(coordinatorFrame.content, /Do not modify files/);
+
+  await updateSetting("multiSession.enabled", false);
+  await assert.rejects(
+    vscode.commands.executeCommand("jcode._test.createTask", {
+      title: "Disabled task",
+      prompt: "This must not run.",
+      mode: "read-only",
+    }),
+    /disabled/i,
+  );
+  await updateSetting("multiSession.enabled", true);
+
+  const gitRepo = path.join(scratch, "worktree-repo");
+  await fs.mkdir(gitRepo, { recursive: true });
+  await git(gitRepo, "init", "-b", "main");
+  await git(gitRepo, "config", "user.name", "Jcode Acceptance");
+  await git(gitRepo, "config", "user.email", "acceptance@jcode.test");
+  await fs.writeFile(path.join(gitRepo, "README.md"), "# Worktree fixture\n");
+  await git(gitRepo, "add", "README.md");
+  await git(gitRepo, "commit", "-m", "fixture: initialize");
+  const repoDocument = await vscode.workspace.openTextDocument(path.join(gitRepo, "README.md"));
+  await vscode.window.showTextDocument(repoDocument);
+
+  const worktreeTask = await vscode.commands.executeCommand("jcode._test.createTask", {
+    title: "Isolated implementation",
+    prompt: "Complete the isolated fixture task.",
+    mode: "worktree",
+    autoCommit: false,
+  });
+  const completedWorktree = await waitFor(async () => {
+    const current = await vscode.commands.executeCommand("jcode._test.getTasks");
+    const task = current.find((item) => item.id === worktreeTask.id);
+    return task?.status === "completed" && task.workingDir && task.branch ? task : undefined;
+  }, "worktree task to complete in its isolated directory", 20000);
+  assert.notEqual(completedWorktree.workingDir, gitRepo);
+  assert.equal(await git(completedWorktree.workingDir, "rev-parse", "--show-toplevel"), completedWorktree.workingDir);
+  await fs.writeFile(path.join(completedWorktree.workingDir, "feature.txt"), "isolated task output\n");
+  const untrackedDiff = await vscode.commands.executeCommand("jcode._test.diffTask", worktreeTask.id);
+  assert.match(untrackedDiff, /feature\.txt/);
+  assert.match(untrackedDiff, /isolated task output/);
+  const taskCommit = await vscode.commands.executeCommand("jcode._test.commitTask", worktreeTask.id);
+  assert.match(taskCommit, /^[0-9a-f]{40}$/);
+  assert.equal(await fs.readFile(path.join(gitRepo, "README.md"), "utf8"), "# Worktree fixture\n");
+  const mergedCommits = await vscode.commands.executeCommand("jcode._test.mergeTask", worktreeTask.id);
+  assert.ok(mergedCommits.includes(taskCommit));
+  assert.equal(await fs.readFile(path.join(gitRepo, "feature.txt"), "utf8"), "isolated task output\n");
+  assert.equal(await git(gitRepo, "status", "--porcelain"), "");
+  await vscode.commands.executeCommand("jcode._test.removeTask", worktreeTask.id, false);
+  assert.equal(fsSync.existsSync(completedWorktree.workingDir), false, "removed tasks must clean up their worktrees");
+  await vscode.window.showTextDocument(repoDocument);
+
+  const mergePair = await vscode.commands.executeCommand("jcode._test.createTasks", [
+    { title: "Concurrent merge A", prompt: "Complete merge fixture A.", mode: "worktree", autoCommit: false },
+    { title: "Concurrent merge B", prompt: "Complete merge fixture B.", mode: "worktree", autoCommit: false },
+  ]);
+  const completedMergePair = await waitFor(async () => {
+    const current = await vscode.commands.executeCommand("jcode._test.getTasks");
+    const selected = current.filter((task) => mergePair.some((created) => created.id === task.id));
+    return selected.length === 2 && selected.every((task) => task.status === "completed") ? selected : undefined;
+  }, "both concurrent merge fixtures to complete", 20000);
+  await fs.writeFile(path.join(completedMergePair[0].workingDir, "merge-a.txt"), "merge A\n");
+  await fs.writeFile(path.join(completedMergePair[1].workingDir, "merge-b.txt"), "merge B\n");
+  await vscode.commands.executeCommand("jcode._test.commitTask", completedMergePair[0].id);
+  await vscode.commands.executeCommand("jcode._test.commitTask", completedMergePair[1].id);
+  await Promise.all([
+    vscode.commands.executeCommand("jcode._test.mergeTask", completedMergePair[0].id),
+    vscode.commands.executeCommand("jcode._test.mergeTask", completedMergePair[1].id),
+  ]);
+  assert.equal(await fs.readFile(path.join(gitRepo, "merge-a.txt"), "utf8"), "merge A\n");
+  assert.equal(await fs.readFile(path.join(gitRepo, "merge-b.txt"), "utf8"), "merge B\n");
+  assert.equal(await git(gitRepo, "status", "--porcelain"), "");
+  for (const task of completedMergePair) {
+    await vscode.commands.executeCommand("jcode._test.removeTask", task.id, false);
+  }
+
+  const conflictTask = await vscode.commands.executeCommand("jcode._test.createTask", {
+    title: "Conflicting implementation",
+    prompt: "Complete the conflict fixture task.",
+    mode: "worktree",
+    autoCommit: false,
+  });
+  const completedConflict = await waitFor(async () => {
+    const current = await vscode.commands.executeCommand("jcode._test.getTasks");
+    const task = current.find((item) => item.id === conflictTask.id);
+    return task?.status === "completed" && task.workingDir ? task : undefined;
+  }, "conflict worktree task to complete", 20000);
+  await fs.writeFile(path.join(completedConflict.workingDir, "README.md"), "# Task branch version\n");
+  await vscode.commands.executeCommand("jcode._test.commitTask", conflictTask.id);
+  await fs.writeFile(path.join(gitRepo, "README.md"), "# Main branch version\n");
+  await git(gitRepo, "add", "README.md");
+  await git(gitRepo, "commit", "-m", "fixture: create merge conflict");
+  await assert.rejects(
+    vscode.commands.executeCommand("jcode._test.mergeTask", conflictTask.id),
+    /conflict/i,
+  );
+  assert.equal(await fs.readFile(path.join(gitRepo, "README.md"), "utf8"), "# Main branch version\n");
+  assert.equal(await git(gitRepo, "status", "--porcelain"), "", "failed task merges must abort cleanly");
+  await vscode.commands.executeCommand("jcode._test.removeTask", conflictTask.id, true);
+  assert.equal(fsSync.existsSync(completedConflict.workingDir), false);
+  await vscode.window.showTextDocument(document);
+
+  const remainingTasks = await vscode.commands.executeCommand("jcode._test.getTasks");
+  for (const task of remainingTasks) {
+    await vscode.commands.executeCommand("jcode._test.removeTask", task.id, true);
+  }
+
   await updateSetting("executablePath", undefined);
   await updateSetting("launchArguments", undefined);
   await updateSetting("maxSelectionCharacters", undefined);
+  await updateSetting("multiSession.enabled", undefined);
+  await updateSetting("multiSession.maxConcurrent", undefined);
+  await updateSetting("multiSession.autoCommit", undefined);
   delete process.env.JCODE_API_SOCKET;
   delete process.env.FAKE_ARGS_LOG;
   delete process.env.FAKE_BRIDGE_LOG;
