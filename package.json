@@ -2,8 +2,8 @@
   "name": "jcode-vscode",
   "displayName": "Jcode",
   "description": "Full Jcode agent wrapper: sidebar chat, editor context, session management, and slash commands over the official jcode SDK (api-bridge).",
-  "version": "0.9.2",
-  "publisher": "jcode",
+  "version": "0.9.3",
+  "publisher": "claudioj",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -13,14 +13,18 @@
     "vscode": "^1.95.0"
   },
   "categories": [
-    "Other",
+    "AI",
     "Machine Learning"
   ],
   "keywords": [
     "jcode",
+    "vscode",
+    "vscode-extension",
     "ai",
-    "agent",
-    "coding"
+    "ai-coding",
+    "coding-agent",
+    "ai-agent",
+    "developer-tools"
   ],
   "activationEvents": [],
   "main": "./extension.js",

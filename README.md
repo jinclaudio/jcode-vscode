@@ -1,8 +1,13 @@
-# Jcode for VS Code
+# Jcode for VS Code — AI Coding Agent Extension
 
-This repository contains a VS Code extension for Jcode. It adds a native Chat view
-to the Activity Bar, can launch the full Jcode TUI in VS Code's integrated terminal,
-and lets the user explicitly send editor selections to the agent.
+Jcode for VS Code is a Visual Studio Code extension that brings the Jcode AI coding
+agent directly into VS Code. It provides a native sidebar chat, editor context,
+multi-turn sessions, slash commands, model selection, and full Jcode terminal
+integration through the official Jcode SDK.
+
+This repository contains the extension: a native Chat view in the Activity Bar, the
+full Jcode TUI in VS Code's integrated terminal, and explicit editor-selection
+commands for asking, explaining, and fixing code.
 
 ## What works
 
