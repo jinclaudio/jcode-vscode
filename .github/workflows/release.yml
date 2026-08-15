@@ -74,10 +74,14 @@ jobs:
           npx @vscode/vsce publish --packagePath "jcode-vscode-${{ github.ref_name }}.vsix"
 
       - name: Publish to Open VSX
-        if: ${{ secrets.OVSX_PAT != '' }}
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
-        run: npx --yes ovsx publish "jcode-vscode-${{ github.ref_name }}.vsix" -p "$OVSX_PAT"
+        run: |
+          if [ -n "$OVSX_PAT" ]; then
+            npx --yes ovsx publish "jcode-vscode-${{ github.ref_name }}.vsix" -p "$OVSX_PAT"
+          else
+            echo "OVSX_PAT not set, skipping Open VSX publish"
+          fi
 
       - name: Attach vsix to GitHub release
         if: github.event_name == 'release'
