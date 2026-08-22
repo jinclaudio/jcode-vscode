@@ -16,7 +16,6 @@ const { spawn } = require("node:child_process");
 const { EventEmitter } = require("node:events");
 
 const ACP_PROTOCOL_VERSION = 1;
-const CONNECT_TIMEOUT_MS = 15000;
 
 /** Resolve the jcode executable, honoring an explicit path or common installs. */
 function resolveJcodeExecutable(configured) {

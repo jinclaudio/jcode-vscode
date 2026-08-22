@@ -15,7 +15,6 @@
 const path = require("node:path");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const { spawn } = require("node:child_process");
 const vscode = require("vscode");
 const { MultiSessionTaskManager } = require("./task-manager");
