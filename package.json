@@ -1,7 +1,7 @@
 {
   "name": "jcode-vscode",
   "displayName": "Jcode",
-  "description": "Full Jcode agent wrapper: sidebar chat, editor context, session management, and slash commands over the official jcode SDK (api-bridge).",
+  "description": "Full Jcode agent wrapper: sidebar chat, editor context, session management, and slash commands over jcode's ACP adapter (`jcode acp`).",
   "version": "0.10.1",
   "publisher": "claudioj",
   "license": "MIT",
@@ -163,15 +163,10 @@
           "default": [],
           "markdownDescription": "Fallback model names for the sidebar chat model picker when Jcode's live model catalog is unreachable. When empty, a built-in curated list is used. The picker normally lists the real catalog from the connected Jcode daemon (`listModels`)."
         },
-        "jcode.apiSocketPath": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Override the harness API socket path used by the sidebar chat. Leave empty for the default (extension storage, or the `JCODE_API_SOCKET` environment variable when set)."
-        },
         "jcode.autoApprove": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Automatically allow permission prompts issued by the agent. When disabled, permission requests surface in the chat for you to approve or deny. (The current api-bridge does not yet advertise the `permissions` capability, so this is a no-op until it does.)"
+          "markdownDescription": "Automatically allow permission prompts issued by the agent. When disabled, a VS Code dialog asks you to allow or deny each permission request during a turn."
         },
         "jcode.shareEditorContext": {
           "type": "boolean",
@@ -224,7 +219,7 @@
     }
   },
   "scripts": {
-    "check": "node --check extension.js && node --check task-manager.js && node --check media/chat.js",
+    "check": "node --check extension.js && node --check task-manager.js && node --check acp-client.js && node --check media/chat.js",
     "check:webview": "node scripts/check-webview.js",
     "test:acceptance": "node scripts/run-acceptance.js",
     "package": "npx @vscode/vsce package"
