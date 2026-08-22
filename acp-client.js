@@ -543,6 +543,15 @@ class AcpClient extends EventEmitter {
 
     let text = "";
     const toolNames = new Map();
+    const toolInputEmitted = new Set();
+    const isTodoPayload = (input) =>
+      input && typeof input === "object" && ("todos" in input || "goals" in input || "plan" in input);
+    const toolNameFor = (update, fallback) => {
+      const rawInput = update.rawInput;
+      return isTodoPayload(rawInput)
+        ? "todo"
+        : update.title || rawInput?.name || toolNames.get(update.toolCallId) || fallback || "tool";
+    };
     const onUpdate = (update) => {
       switch (update.sessionUpdate) {
         case "agent_message_chunk": {
@@ -566,14 +575,22 @@ class AcpClient extends EventEmitter {
           onEvent({
             ev: "tool_start",
             call_id: update.toolCallId,
-            name: update.title || update.rawInput?.name || "tool",
+            name: toolNameFor(update, ""),
             detail: "",
           });
           break;
         }
         case "tool_call_update": {
           const callId = update.toolCallId;
-          const name = update.title || toolNames.get(callId) || update.rawInput?.name || "tool";
+          const name = toolNameFor(update, "");
+          // The ACP wire has no tool_input_delta; surface a tool's raw input
+          // (which for the todo tool is the todo/goal JSON) once so the
+          // extension's todo dashboard can capture it.
+          const rawInput = update.rawInput;
+          if (rawInput && typeof rawInput === "object" && Object.keys(rawInput).length > 0 && !toolInputEmitted.has(callId)) {
+            toolInputEmitted.add(callId);
+            onEvent({ ev: "tool_input_delta", call_id: callId, delta: JSON.stringify(rawInput) });
+          }
           if (update.status === "in_progress") {
             onEvent({ ev: "tool_exec", call_id: callId, name });
           } else if (update.status === "completed" || update.status === "failed") {
