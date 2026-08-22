@@ -1,10 +1,9 @@
 // jcode VS Code extension.
 //
-// Full wrapper around the jcode harness API (protocol v1), served by
-// `jcode api-bridge` over a Unix socket. The official TypeScript SDK
-// (@1jehuang/jcode-sdk) is bundled with the extension; the bridge is started
-// automatically the first time it is needed and shared with the user's own
-// jcode, so sessions created here are the same ones the terminal TUI shows.
+// Full wrapper around jcode via its Agent Client Protocol (ACP) adapter
+// (`jcode acp`, JSON-RPC over stdio). See acp-client.js. The adapter is
+// started automatically the first time it is needed and shares the user's
+// sessions with the terminal TUI.
 //
 // Layout:
 //   extension.js   this file: activation, connection manager, chat provider
@@ -16,10 +15,10 @@
 const path = require("node:path");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
-const os = require("node:os");
 const { spawn } = require("node:child_process");
 const vscode = require("vscode");
 const { MultiSessionTaskManager } = require("./task-manager");
+const { AcpClient, resolveJcodeExecutable } = require("./acp-client");
 
 const TERMINAL_NAME = "Jcode";
 const CHAT_VIEW_ID = "jcode.chatView";
@@ -201,36 +200,18 @@ function log(...parts) {
   );
 }
 
-// The chat backend talks to the user's jcode through the official TypeScript
-// SDK (@1jehuang/jcode-sdk), which dials the `jcode api-bridge` Unix socket.
-// The bridge is started automatically (detached) the first time it is needed,
-// unless one is already running.
-let sdkPromise;
+// The chat backend talks to the user's jcode through the ACP adapter
+// (`jcode acp`). Each connection is a stdio subprocess; the shared client
+// serves the main chat session, and the task manager opens dedicated clients
+// for parallel tasks.
 let clientPromise;
 let currentClient;
-let bridgeProcess;
-let extensionApiSocket;
 
-function getSdk() {
-  if (!sdkPromise) {
-    sdkPromise = Promise.race([
-      import("@1jehuang/jcode-sdk"),
-      new Promise((_, reject) =>
-        setTimeout(
-          () => reject(new Error("timed out after 10s while loading the Jcode SDK module")),
-          10000,
-        ),
-      ),
-    ]).catch((error) => {
-      sdkPromise = undefined;
-      const message =
-        `The Jcode TypeScript SDK could not be loaded (${errorMessage(error)}). ` +
-        "Install extension dependencies with \"npm install\" in the extension folder, then reload the window.";
-      log(message);
-      throw new Error(message);
-    });
-  }
-  return sdkPromise;
+function acpOptions() {
+  const config = vscode.workspace.getConfiguration("jcode");
+  const executable = resolveJcodeExecutable(config.get("executablePath", "jcode"));
+  const args = Array.isArray(config.get("launchArguments", [])) ? config.get("launchArguments", []) : [];
+  return { executable, args, clientName: CLIENT_NAME, log };
 }
 
 function sleep(milliseconds) {
@@ -255,14 +236,14 @@ function cancelledError() {
   return error;
 }
 
-/** Connect to the harness API, starting `jcode api-bridge` when needed. */
+/** Connect to jcode, starting the ACP adapter when needed. */
 async function getJcodeClient() {
   if (currentClient?.closed) {
     currentClient = undefined;
     clientPromise = undefined;
   }
   if (!clientPromise) {
-    clientPromise = connectWithBridge();
+    clientPromise = connectAcp();
   }
   try {
     const client = await clientPromise;
@@ -274,88 +255,40 @@ async function getJcodeClient() {
   }
 }
 
-/** Create a dedicated SDK connection for one concurrent task run. */
+/** Create a dedicated ACP connection for one concurrent task run. */
 async function createJcodeTaskClient() {
-  // Ensure the shared bridge exists before opening an additional connection.
-  await getJcodeClient();
-  const { JcodeClient } = await getSdk();
-  const apiSocket = getApiSocketPath();
+  const options = acpOptions();
+  options.clientName = `${CLIENT_NAME}/task`;
   const client = await withTimeout(
-    JcodeClient.connect({ clientName: `${CLIENT_NAME}/task`, socketPath: apiSocket }),
-    5000,
-    "dialing a parallel task connection",
+    AcpClient.connect(options),
+    15000,
+    "starting a parallel task acp client",
   );
-  log("connected dedicated parallel task client");
+  client.onPermissionRequest = handlePermissionRequest;
+  log("connected dedicated parallel task acp client");
   return client;
 }
 
-async function connectWithBridge() {
-  const { JcodeClient } = await getSdk();
-  const apiSocket = getApiSocketPath();
-  log(`connecting to harness API at ${apiSocket || "<default socket>"}`);
+async function connectAcp() {
+  const options = acpOptions();
+  log(`connecting to jcode acp (${options.executable})`);
   try {
     const client = await withTimeout(
-      JcodeClient.connect({ clientName: CLIENT_NAME, socketPath: apiSocket }),
-      5000,
-      "dialing the harness API socket",
+      AcpClient.connect(options),
+      BRIDGE_CONNECT_TIMEOUT_MS,
+      "starting and initializing jcode acp",
     );
     watchClientLiveness(client);
-    log("connected to existing harness API");
+    client.onPermissionRequest = handlePermissionRequest;
+    log("connected to jcode acp");
     return client;
-  } catch (firstError) {
-    if (firstError?.code !== "connect_failed") {
-      log(`harness API connection rejected: ${errorMessage(firstError)}`);
-      throw firstError;
-    }
-    log(`no harness API at ${apiSocket || "<default socket>"}: starting api-bridge`);
-    removeOwnedStaleSocket(apiSocket);
-    spawnBridge(apiSocket);
-    const deadline = Date.now() + BRIDGE_CONNECT_TIMEOUT_MS;
-    let lastError = firstError;
-    while (Date.now() < deadline) {
-      await sleep(300);
-      if (!bridgeProcess || bridgeProcess.exitCode !== null || bridgeProcess.signalCode !== null) {
-        spawnBridge(apiSocket);
-      }
-      try {
-        const client = await withTimeout(
-          JcodeClient.connect({ clientName: CLIENT_NAME, socketPath: apiSocket }),
-          5000,
-          "dialing the harness API socket",
-        );
-        watchClientLiveness(client);
-        log("connected to spawned harness API");
-        return client;
-      } catch (error) {
-        lastError = error;
-      }
-    }
+  } catch (error) {
     const message =
-      `Could not reach the Jcode harness API (${errorMessage(lastError)}). ` +
-      "Make sure the Jcode CLI is installed and new enough to support `jcode api-bridge`. " +
-      "Check the Jcode output channel for bridge diagnostics, or set `jcode.executablePath` to the absolute path of the jcode binary.";
+      `Could not start the jcode ACP adapter (${errorMessage(error)}). ` +
+      "Make sure the Jcode CLI is installed and new enough to support `jcode acp` (v0.79 or newer). " +
+      "Check the Jcode output channel for diagnostics, or set `jcode.executablePath` to the absolute path of the jcode binary.";
     log(message);
     throw new Error(message);
-  }
-}
-
-function getApiSocketPath() {
-  if (process.env.JCODE_API_SOCKET) {
-    return process.env.JCODE_API_SOCKET;
-  }
-  const configured = vscode.workspace.getConfiguration("jcode").get("apiSocketPath", "");
-  if (typeof configured === "string" && configured) {
-    return configured;
-  }
-  return extensionApiSocket;
-}
-
-function removeOwnedStaleSocket(apiSocket) {
-  if (process.platform === "win32" || !apiSocket || apiSocket !== extensionApiSocket) return;
-  try {
-    fs.unlinkSync(apiSocket);
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
   }
 }
 
@@ -369,61 +302,21 @@ function watchClientLiveness(client) {
   });
 }
 
-function spawnBridge(apiSocket) {
-  if (bridgeProcess && bridgeProcess.exitCode === null && bridgeProcess.signalCode === null) {
-    return;
-  }
-  const config = vscode.workspace.getConfiguration("jcode");
-  const executable = resolveJcodeExecutable(config.get("executablePath", "jcode"));
-  const configuredArguments = config.get("launchArguments", []);
-  const args = [...configuredArguments, "--no-update", "api-bridge"];
-  if (apiSocket) {
-    args.push("--api-socket", apiSocket);
-  }
-  log(`starting bridge: ${executable} ${args.join(" ")}`);
+/** Ask the user to allow or deny a tool permission request from the agent. */
+async function handlePermissionRequest(request) {
+  const label = request.description || request.tool_name || "this action";
+  let choice;
   try {
-    const child = spawn(executable, args, {
-      detached: true,
-      stdio: ["ignore", "ignore", "pipe"],
-      env: { ...process.env },
-    });
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => {
-      log(`bridge stderr: ${chunk.trim()}`);
-    });
-    child.on("error", (error) => {
-      log(`bridge spawn error: ${errorMessage(error)}`);
-      if (bridgeProcess === child) bridgeProcess = undefined;
-    });
-    child.on("exit", (code, signal) => {
-      log(`bridge exited: code=${code} signal=${signal}`);
-      if (bridgeProcess === child) bridgeProcess = undefined;
-    });
-    child.unref();
-    bridgeProcess = child;
-  } catch (error) {
-    log(`bridge spawn threw: ${errorMessage(error)}`);
+    choice = await vscode.window.showWarningMessage(
+      `Allow Jcode to run: ${label}?`,
+      { modal: false },
+      "Allow",
+      "Deny",
+    );
+  } catch {
+    choice = undefined;
   }
-}
-
-function resolveJcodeExecutable(configured) {
-  if (configured !== "jcode") return configured;
-  const candidates = [
-    path.join(os.homedir(), ".local", "bin", "jcode"),
-    path.join(os.homedir(), ".jcode", "builds", "current", "jcode"),
-    "/opt/homebrew/bin/jcode",
-    "/usr/local/bin/jcode",
-  ];
-  for (const candidate of candidates) {
-    try {
-      if (fs.existsSync(candidate)) {
-        return candidate;
-      }
-    } catch {
-      // Unreadable path; try the next candidate.
-    }
-  }
-  return configured;
+  request.respond(choice === "Allow" ? "allow" : "deny");
 }
 
 /**
@@ -433,7 +326,7 @@ function activate(context) {
   log("extension activated");
   if (context.globalStorageUri.scheme === "file") {
     fs.mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
-    extensionApiSocket = path.join(context.globalStorageUri.fsPath, "api.sock");
+    // (no per-extension socket; the ACP adapter uses stdio)
   }
   lastTextEditor = vscode.window.activeTextEditor;
   const chatProvider = new JcodeChatProvider(context);
@@ -579,11 +472,9 @@ function activate(context) {
 async function runDiagnostics(context) {
   const config = vscode.workspace.getConfiguration("jcode");
   const executable = resolveJcodeExecutable(config.get("executablePath", "jcode"));
-  const socket = getApiSocketPath();
   log("=== jcode diagnostics ===");
   log(`version: ${CLIENT_NAME}`);
   log(`executable: ${executable}`);
-  log(`api socket: ${socket || "<SDK default>"}`);
   log(`launchArguments: ${JSON.stringify(config.get("launchArguments", []))}`);
   try {
     const client = await getJcodeClient();

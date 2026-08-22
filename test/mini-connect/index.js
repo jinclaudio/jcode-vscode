@@ -1,5 +1,5 @@
-// Minimal Extension Host test: verify the extension connects through its
-// default globalStorage socket path in the real exthost runtime.
+// Minimal Extension Host test: verify the extension connects to `jcode acp`
+// through its real connection path in the real exthost runtime.
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -21,20 +21,12 @@ async function run() {
   console.log("MINI: extension found:", extension.id);
   await extension.activate();
   console.log("MINI: extension activated, isActive:", extension.isActive);
-  const globalStorageUri = extension.globalStorageUri || extension.extensionUri;
-  console.log("MINI: globalStorageUri:", globalStorageUri.toString());
 
-  // Do NOT set JCODE_API_SOCKET: exercise the extension's default socket path
-  // under its real globalStorage directory (like the user's environment).
-  const apiSocket = path.join(globalStorageUri.fsPath, "api.sock");
-  console.log("MINI: default api socket path:", apiSocket);
-  try { fs.unlinkSync(apiSocket); } catch {}
-
-  // Use the extension's default executable (real jcode).
+  // Use the extension's default executable (real jcode with `acp`).
   await vscode.workspace.getConfiguration("jcode").update("executablePath", "jcode", vscode.ConfigurationTarget.Global);
 
   try {
-    console.log("MINI: sending chat through the extension's real connection path...");
+    console.log("MINI: sending chat through the extension's real ACP connection path...");
     const result = await vscode.commands.executeCommand(
       "jcode._test.sendChat",
       "Reply with the single word: connected",
@@ -42,7 +34,6 @@ async function run() {
     );
     console.log("MINI: sendChat result:", JSON.stringify(result).slice(0, 200));
     if (result && result.session_id) {
-      console.log("MINI: socket after connect:", fs.existsSync(apiSocket));
       await writePass(resultMarker, `session=${result.session_id}`);
     } else {
       await writeFail(resultMarker, `sendChat returned ${JSON.stringify(result)}`);

@@ -10,170 +10,9 @@ const vscode = require("vscode");
 const EXTENSION_ID = "claudioj.jcode-vscode";
 const execFileAsync = promisify(execFile);
 
-const FAKE_BRIDGE_PY = String.raw`#!/usr/bin/env python3
-import json, os, socket, sys, threading, time
-
-ARGS_LOG = os.environ.get("FAKE_ARGS_LOG", "")
-BRIDGE_LOG = os.environ.get("FAKE_BRIDGE_LOG", "")
-
-def log_args():
-    if ARGS_LOG:
-        with open(ARGS_LOG, "a") as f:
-            f.write("\0".join(sys.argv[1:]) + "\n")
-
-def log_frame(frame):
-    if BRIDGE_LOG:
-        with open(BRIDGE_LOG, "a") as f:
-            f.write(json.dumps(frame) + "\n")
-
-args = sys.argv[1:]
-if "api-bridge" not in args:
-    log_args()
-    for _line in sys.stdin:
-        pass
-    sys.exit(0)
-
-sock_path = None
-for i, a in enumerate(args):
-    if a == "--api-socket" and i + 1 < len(args):
-        sock_path = args[i + 1]
-if not sock_path:
-    sock_path = os.environ.get("JCODE_API_SOCKET", "/tmp/fake-jcode-api.sock")
-try:
-    os.unlink(sock_path)
-except FileNotFoundError:
-    pass
-
-MODELS = ["test-model-a", "test-model-b", "gpt-5.5", "claude-opus-4-6"]
-state = {"sessions": {}, "next_session": 1, "current": "test-model-a"}
-
-def emit(conn, frame):
-    conn.sendall((json.dumps(frame) + "\n").encode())
-
-def send_message(conn, frame):
-    sid = frame["session_id"]
-    content = frame["content"]
-    state["sessions"][sid].setdefault("history", []).append({"role": "user", "content": content})
-    emit(conn, {"v": 1, "ev": "message_accepted", "session_id": sid})
-    if "WAIT_FOR_CANCEL" in content:
-        state.setdefault("pending", {})[sid] = conn
-        return
-    if "SHOW_METRICS" in content:
-        todo_input = json.dumps({"todos": [
-            {"id": "live", "content": "Implement live dashboard", "status": "in_progress", "priority": "high", "group": "metrics", "confidence": "plausible"},
-            {"id": "tested", "content": "Validate metric calculations", "status": "completed", "priority": "low", "group": "metrics", "confidence": "validated", "completion_confidence": "verified"}
-        ]})
-        emit(conn, {"v": 1, "ev": "tool_start", "session_id": sid, "call_id": "todo-1", "name": "todo"})
-        # Match the current production bridge: tool_input has no call id even
-        # though start/exec/done use the real id.
-        emit(conn, {"v": 1, "ev": "tool_input_delta", "session_id": sid, "call_id": "", "delta": todo_input[:len(todo_input)//2]})
-        emit(conn, {"v": 1, "ev": "tool_input_delta", "session_id": sid, "call_id": "", "delta": todo_input[len(todo_input)//2:]})
-        emit(conn, {"v": 1, "ev": "tool_exec", "session_id": sid, "call_id": "todo-1", "name": "todo"})
-        emit(conn, {"v": 1, "ev": "tool_done", "session_id": sid, "call_id": "todo-1", "name": "todo", "output": "ok"})
-        emit(conn, {"v": 1, "ev": "token_usage", "session_id": sid, "input": 250, "output": 100, "cache_read_input": 750})
-    text = "FAKE_CHAT_RESPONSE: " + content[:80]
-    state["sessions"][sid].setdefault("history", []).append({"role": "assistant", "content": text})
-    emit(conn, {"v": 1, "ev": "text_delta", "session_id": sid, "text": text})
-    emit(conn, {"v": 1, "ev": "turn_done", "session_id": sid})
-
-def handle(conn, frame):
-    log_frame(frame)
-    req = frame.get("req")
-    rid = frame.get("id")
-    reply = lambda ev, **kw: emit(conn, {"v": 1, "reply_to": rid, "ev": ev, **kw})
-    if req == "hello":
-        reply("hello_ok", version=1, server="fake-jcode-bridge/0.1.0",
-              capabilities=["sessions", "streaming", "runtime_info"])
-    elif req == "create_session":
-        sid = "fake-session-%d" % state["next_session"]
-        state["next_session"] += 1
-        state["sessions"][sid] = {"working_dir": frame.get("working_dir"), "title": "", "history": []}
-        reply("attached", session={"session_id": sid, "working_dir": frame.get("working_dir"), "status": "idle"})
-    elif req == "attach_session":
-        sid = frame["session_id"]
-        if sid not in state["sessions"]:
-            reply("error", code="unknown_session", message="no such session")
-        else:
-            reply("attached", session={"session_id": sid, "working_dir": state["sessions"][sid]["working_dir"], "status": "idle"})
-    elif req == "detach_session":
-        reply("ok")
-    elif req == "rename_session":
-        state["sessions"][frame["session_id"]]["title"] = frame.get("title", "")
-        reply("ok")
-    elif req == "list_sessions":
-        reply("sessions", sessions=[
-            {"session_id": sid, "working_dir": item.get("working_dir"), "title": item.get("title"), "status": "idle"}
-            for sid, item in state["sessions"].items()
-        ])
-    elif req == "get_history":
-        sid = frame["session_id"]
-        reply("history", session_id=sid, messages=state["sessions"].get(sid, {}).get("history", []))
-    elif req == "list_models":
-        reply("models", session_id=frame["session_id"], models=MODELS, current=state["current"])
-    elif req == "get_runtime_info":
-        reply("runtime_info", session_id=frame["session_id"], provider="test-provider",
-              model=state["current"], routes=[])
-    elif req == "set_model":
-        model = frame["model"]
-        if model == "bad-model":
-            reply("error", code="invalid_request", message="unknown model")
-        else:
-            state["current"] = model
-            reply("ok")
-    elif req == "set_reasoning_effort":
-        reply("ok")
-    elif req == "send_message":
-        send_message(conn, frame)
-    elif req == "soft_interrupt":
-        reply("ok")
-    elif req == "cancel":
-        reply("ok")
-        sid = frame.get("session_id")
-        pending_conn = state.get("pending", {}).pop(sid, None)
-        if pending_conn:
-            emit(pending_conn, {"v": 1, "ev": "text_delta", "session_id": sid, "text": "FAKE_CHAT_RESPONSE: partial"})
-            emit(pending_conn, {"v": 1, "ev": "turn_done", "session_id": sid})
-    elif req == "clear":
-        reply("ok")
-    elif req == "ping":
-        reply("pong")
-    else:
-        reply("error", code="unknown_request", message="unhandled: " + str(req))
-
-def serve(conn):
-    buf = b""
-    try:
-        while True:
-            chunk = conn.recv(65536)
-            if not chunk:
-                return
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                if not line.strip():
-                    continue
-                try:
-                    frame = json.loads(line.decode())
-                except json.JSONDecodeError:
-                    continue
-                handle(conn, frame)
-    except (ConnectionError, OSError):
-        return
-
-def watchdog(sock_path):
-    while True:
-        time.sleep(0.5)
-        if not os.path.exists(sock_path):
-            os._exit(0)
-
-srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-srv.bind(sock_path)
-srv.listen(8)
-threading.Thread(target=watchdog, args=(sock_path,), daemon=True).start()
-while True:
-    conn, _ = srv.accept()
-    threading.Thread(target=serve, args=(conn,), daemon=True).start()
-`;
+// The fake ACP adapter lives in test/acceptance/fake-acp-bridge.py. It speaks
+// the Agent Client Protocol over stdio and logs *normalized* request frames
+// (old SDK-style field names) so the assertions below keep working.
 
 async function waitFor(predicate, message, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
@@ -226,17 +65,18 @@ async function run() {
   }
   const argsLog = path.join(scratch, "args.log");
   const bridgeLog = path.join(scratch, "bridge.log");
-  const apiSocket = path.join(scratch, "api.sock");
-  const fakeJcode = path.join(scratch, "fake-jcode.py");
+  const fakeJcodeHome = path.join(scratch, "fake-jcode-home");
+  const fakeJcode = path.join(__dirname, "fake-acp-bridge.py");
   const sourceFile = path.join(scratch, "sample.js");
 
-  // The extension (running in this same Extension Host) reads these variables
-  // to know where to reach the bridge and where the fake should log.
-  process.env.JCODE_API_SOCKET = apiSocket;
+  // The extension reads JCODE_HOME for the session directory; the fake writes
+  // its sessions there so the disk-based session list/history work.
+  process.env.JCODE_HOME = fakeJcodeHome;
   process.env.FAKE_ARGS_LOG = argsLog;
   process.env.FAKE_BRIDGE_LOG = bridgeLog;
 
-  await fs.writeFile(fakeJcode, FAKE_BRIDGE_PY, { mode: 0o755 });
+  await fs.mkdir(fakeJcodeHome, { recursive: true });
+  try { await fs.chmod(fakeJcode, 0o755); } catch {}
   await fs.writeFile(sourceFile, "const alpha = 1;\nconst beta = alpha + 2;\n");
 
   const extension = vscode.extensions.getExtension(EXTENSION_ID);
@@ -478,11 +318,11 @@ async function run() {
   frames = await readBridgeFrames(bridgeLog);
   assert.ok(frames.some((frame) => frame.req === "set_model" && frame.model === "test-model-b"));
   assert.ok(frames.some((frame) => frame.req === "set_reasoning_effort" && frame.effort === "low"));
-  assert.ok(frames.some((frame) => frame.req === "clear" && frame.session_id === "fake-session-1"));
+  assert.ok(frames.some((frame) => frame.req === "send_message" && frame.content === "/clear"));
   assert.equal(
     frames.filter((frame) => frame.req === "send_message").length,
-    sendCountBeforeSlash,
-    "slash commands must not be sent as model prompts",
+    sendCountBeforeSlash + 1,
+    "only /clear is sent as a prompt; /model and /effort route to native operations",
   );
 
   const imageId = await vscode.commands.executeCommand(
@@ -632,17 +472,11 @@ async function run() {
   const firstAttachIndex = competingFrames.findIndex(
     (frame) => frame.req === "attach_session" && frame.session_id === "fake-session-1",
   );
-  const firstHistoryIndex = competingFrames.findIndex(
-    (frame) => frame.req === "get_history" && frame.session_id === "fake-session-1",
-  );
   const secondAttachIndex = competingFrames.findIndex(
     (frame) => frame.req === "attach_session" && frame.session_id === "fake-session-2",
   );
-  assert.ok(firstAttachIndex >= 0 && firstHistoryIndex > firstAttachIndex);
-  assert.ok(
-    secondAttachIndex > firstHistoryIndex,
-    "the second attach must not cross the first session's restore boundary",
-  );
+  assert.ok(firstAttachIndex >= 0 && secondAttachIndex > firstAttachIndex,
+    "competing switches must attach in request order");
 
   await vscode.commands.executeCommand("jcode._test.setModel", "");
   await vscode.commands.executeCommand("jcode._test.setEffort", "");
@@ -762,12 +596,8 @@ async function run() {
     sendCountDuringTurn,
     "steering must not start a second model turn",
   );
-  assert.ok(
-    (await readBridgeFrames(bridgeLog)).some(
-      (frame) => frame.req === "soft_interrupt" && frame.content === "STEER_CURRENT_RESPONSE" && frame.urgent === false,
-    ),
-    "a message sent during generation must use the SDK softInterrupt operation",
-  );
+  // ACP has no mid-turn soft interrupt, so steering must not cross the bridge;
+  // the extension still acknowledges the steering locally without a second turn.
   await vscode.commands.executeCommand("jcode._test.sendChat", "/cancel", false);
   assert.equal(
     (await readBridgeFrames(bridgeLog)).some(
@@ -980,7 +810,7 @@ async function run() {
   await updateSetting("multiSession.enabled", undefined);
   await updateSetting("multiSession.maxConcurrent", undefined);
   await updateSetting("multiSession.autoCommit", undefined);
-  delete process.env.JCODE_API_SOCKET;
+  delete process.env.JCODE_HOME;
   delete process.env.FAKE_ARGS_LOG;
   delete process.env.FAKE_BRIDGE_LOG;
   await vscode.commands.executeCommand("jcode._test.newChat");

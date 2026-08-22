@@ -3,11 +3,12 @@
 Jcode for VS Code is a Visual Studio Code extension that brings the Jcode AI coding
 agent directly into VS Code. It provides a native sidebar chat, editor context,
 multi-turn sessions, slash commands, model selection, and full Jcode terminal
-integration through the official Jcode SDK.
+integration.
 
-This repository contains the extension: a native Chat view in the Activity Bar, the
-full Jcode TUI in VS Code's integrated terminal, and explicit editor-selection
-commands for asking, explaining, and fixing code.
+The extension talks to Jcode through its Agent Client Protocol (ACP) adapter
+(`jcode acp`), a JSON-RPC 2.0 stdio transport. It shares the user's live Jcode
+sessions, so conversations started in the sidebar are the same ones the terminal
+TUI shows, and vice versa.
 
 ## What works
 
@@ -15,7 +16,7 @@ commands for asking, explaining, and fixing code.
 - `Jcode: Open Chat` focuses the Chat page. `Jcode: Open Terminal Agent` starts the
   full Jcode TUI in the current workspace.
 - The conversation title in the Chat header opens a session switcher. Select any
-  active Jcode session to replace the visible transcript with that session's history and
+  Jcode session to replace the visible transcript with that session's history and
   continue talking in it directly. New Chat starts a separate conversation without
   mixing messages from the previous session.
 - The Chat page supports multi-turn sessions, cancellation, live streaming replies,
@@ -30,11 +31,11 @@ commands for asking, explaining, and fixing code.
   Shared-workspace and read-only modes are also available for tasks that do not need
   branch isolation.
 - The composer supports file and image attachments, removable attachment chips, and
-  direct clipboard image paste. Images use the SDK's native attachment field; other
-  files are shared as exact local paths for Jcode to read.
+  direct clipboard image paste. Images use ACP image content blocks; other files are
+  shared as exact local paths for Jcode to read.
 - Type `/` for command autocomplete backed by the full TUI slash-command catalog
   (from jcode's `REGISTERED_COMMANDS`). Commands run in five ways: **native**
-  (SDK operations like `/model`, `/effort`, `/clear`, `/compact`, `/rewind`,
+  (ACP operations like `/model`, `/effort`, `/clear`, `/compact`, `/rewind`,
   `/rename`, `/info`, `/resume` session picker), **prompt** (the same synthetic
   user-turn templates the TUI uses, e.g. `/commit`, `/plan`, `/fix`, `/test`),
   **cli** (`jcode <subcommand>` output cards, e.g. `/usage`, `/memory`,
@@ -49,51 +50,44 @@ commands for asking, explaining, and fixing code.
   clicking an icon opens only that icon's corresponding compact detail panel.
   State is retained per session and context-window
   inference follows Jcode's model-family defaults (overridable with
-  `jcode.contextWindowTokens`). Permission requests are surfaced when the bridge
-  advertises the `permissions` capability.
+  `jcode.contextWindowTokens`). Permission requests surface as a VS Code dialog
+  unless `jcode.autoApprove` is enabled.
 - With `jcode.shareEditorContext` (default on), each message includes a compact
   summary of the active editor, selection, open files, dirty files, and
   workspace root, so the agent knows what you are looking at in VS Code.
-- While Jcode is generating, the composer remains editable and the send button
-  submits steering through the SDK's `softInterrupt` operation without starting
-  a second turn. The separate stop button still cancels the active response.
+- The separate stop button cancels the active response.
 - `Jcode: Run Connection Diagnostics` (or `/diagnose` in the output channel)
-  prints executable, socket, protocol, provider, and session information.
+  prints executable, protocol, provider, and session information.
 - The webview UI lives in `media/` (external `chat.js` / `style.css`, loaded via
   `webview.asWebviewUri`), so its syntax is checked by `npm run check` and
   `npm run check:webview` instead of failing silently at runtime.
 - The Chat page uses a compact Claude Code-inspired layout with a floating composer,
   starter prompts, attachment chips, command cards, and live connection status.
-- The Chat page has a VS Code native Quick Pick populated from Jcode's live
-  `getRuntimeInfo().providers/routes` catalog and grouped by the actual route
-  provider. Duplicate model names remain separate when they use different auth or
-  API routes, unavailable routes are labelled, and selection sends Jcode's exact
-  routed model spec (`claude-api:`, `openai-oauth:`, OpenRouter `@provider`, or an
-  OpenAI-compatible profile) instead of an inferred model name. A reasoning-effort
+- The Chat page has a VS Code native Quick Pick populated from Jcode's live model
+  catalog (`session/new` config options) grouped by provider. A reasoning-effort
   selector supports `none` … `max`, subject to what the provider accepts. Choices
-  persist per workspace and are applied through the Jcode SDK (`listModels` /
-  `getRuntimeInfo` / `setModel` / `setReasoningEffort`), and to the terminal agent
-  through `-m` and the reasoning-effort environment variables.
+  persist per workspace and are applied through the ACP `session/set_config_option`
+  method, and to the terminal agent through `-m` and the reasoning-effort
+  environment variables.
 - Select code and press `Ctrl+Shift+J` (`Cmd+Shift+J` on macOS) to attach it and focus Chat.
 - The editor context menu includes ask, explain, and fix commands.
 - Multiple selections are supported.
 - Unsaved selected text is supported. The extension writes an exact local snapshot
   under VS Code extension storage and tells Jcode to read it.
-- Sidebar prompts run over the Jcode harness API (protocol v1) through the official
-  [`@1jehuang/jcode-sdk`](https://jcode.sh/sdk). The extension connects to the
-  `jcode api-bridge` socket, starting the bridge automatically when it is not
-  already running, and shares the user's live Jcode sessions.
+- Sidebar prompts run over the ACP protocol (v1) through the `jcode acp` adapter.
+  The extension starts the adapter automatically when needed and shares the user's
+  live Jcode sessions.
 - Selection content is only shared after an explicit command. It is not captured or
   transmitted continuously.
 
 ## Requirements
 
-1. Install Jcode and ensure `jcode` is on `PATH`.
+1. Install Jcode v0.79 or newer (the version that replaced `jcode api-bridge` with
+   `jcode acp`) and ensure `jcode` is on `PATH`.
 2. Run `jcode` once in a terminal and finish provider authentication.
 3. Open this folder in VS Code and press `F5` to launch an Extension Development Host.
 
-The extension has one runtime npm dependency, `@1jehuang/jcode-sdk`. Install it and
-package with:
+The extension has no runtime npm dependencies. Package with:
 
 ```bash
 npm install
@@ -106,11 +100,11 @@ npm run package
 
 - extension activation and command registration;
 - Activity Bar container and Webview view contributions;
-- chat sessions over the harness API: session creation, multi-turn reuse, direct
+- chat sessions over the ACP adapter: session creation, multi-turn reuse, direct
   switching with isolated transcript restoration, New Chat, streaming replies,
-  model and reasoning-effort switching, native slash-command
-  routing (including in-flight `/cancel` and literal slash escaping), image
-  attachments, and cancellation (against a fake bridge that speaks the SDK protocol);
+  model and reasoning-effort switching, native slash-command routing (including
+  in-flight `/cancel` and literal slash escaping), image attachments, and
+  cancellation;
 - parallel task sessions: concurrent execution, distinct session IDs, independent
   cancellation, queue limits, dependency ordering, and coordinator synthesis;
 - Git integration in a temporary real repository: worktree creation, branch isolation,
@@ -136,15 +130,15 @@ On Linux CI, the same test can run under Xvfb by invoking VS Code with
 If the chat stays on "Connecting…" or a message fails to send:
 
 1. Open the **Output** panel (`View → Output`) and pick the **Jcode** channel. It
-   logs every connection step: SDK loading, bridge startup (with the bridge's own
-   stderr), socket dialing, and chat send failures.
-2. If the bridge fails to start, the log shows why. Common causes:
+   logs every connection step: ACP startup (with the adapter's own stderr),
+   initialization, and chat send failures.
+2. If the adapter fails to start, the log shows why. Common causes:
    - `jcode` is not on `PATH` and not in a probed location
      (`~/.local/bin`, `~/.jcode/builds/current`, `/opt/homebrew/bin`,
      `/usr/local/bin`). Set `jcode.executablePath` to the absolute path.
-   - The installed `jcode` is too old for `jcode api-bridge`; update it.
-3. The connection has hard timeouts (SDK load 10s, socket dial 5s, session
-   restore 45s), so a stuck state always becomes a visible error message.
+   - The installed `jcode` is too old for `jcode acp` (need v0.79+); update it.
+3. The connection has hard timeouts (ACP startup 15s, session restore 45s), so a
+   stuck state always becomes a visible error message.
 
 ## Configuration
 
@@ -164,19 +158,14 @@ If the chat stays on "Connecting…" or a message fails to send:
   live model catalog is unreachable. When empty, a built-in curated list is used.
 - `jcode.defaultEffort`: default reasoning effort (`none`, `minimal`, `low`,
   `medium`, `high`, `xhigh`, `max`; the accepted set depends on the provider).
-  Applied to new chat sessions through the SDK's `setReasoningEffort` and passed
-  to the terminal agent through the `JCODE_OPENAI_REASONING_EFFORT` /
-  `JCODE_ANTHROPIC_REASONING_EFFORT` environment variables.
-- `jcode.apiSocketPath`: override the harness API socket path the extension
-  connects to and starts the bridge on. Defaults to the extension's global
-  storage; `JCODE_API_SOCKET` (environment variable) wins over this setting.
+  Applied to new chat sessions through ACP and passed to the terminal agent through
+  the `JCODE_OPENAI_REASONING_EFFORT` / `JCODE_ANTHROPIC_REASONING_EFFORT`
+  environment variables.
 - `jcode.autoApprove`: automatically allow permission prompts issued by the
-  agent. Currently a no-op because the bridge does not yet advertise the
-  `permissions` capability.
+  agent. When disabled, a VS Code dialog asks you to allow or deny each
+  permission request during a turn.
 - `jcode.shareEditorContext`: include the active editor / open files summary in
   each sidebar message.
-- `JCODE_API_SOCKET` (environment variable): overrides the harness API socket path
-  the extension connects to and starts the bridge on.
 
 Example `settings.json`:
 
@@ -191,18 +180,21 @@ Example `settings.json`:
 
 ## Architecture
 
-The sidebar chats with Jcode over the stable harness API (protocol v1) through the
-official TypeScript SDK. The extension connects to the user's `jcode api-bridge`
-(autostarting it if needed), creates or resumes the primary per-workspace chat session,
-and gives every parallel task its own SDK session and working directory. A persisted
-`MultiSessionTaskManager` schedules bounded concurrent workers, resolves dependencies,
-restores detached task metadata, and publishes task state to the Webview.
+The sidebar chats with Jcode over the ACP protocol (v1) through the `jcode acp`
+adapter (see `acp-client.js`). The extension starts the adapter automatically if
+needed, creates or resumes the primary per-workspace chat session, and gives every
+parallel task its own adapter connection and working directory. Session discovery
+and history read Jcode's persisted state under `~/.jcode/sessions`. A persisted
+`MultiSessionTaskManager` schedules bounded concurrent workers, resolves
+dependencies, restores detached task metadata, and publishes task state to the
+Webview.
 
-Editable workers use Git worktrees under extension global storage. Diff and commit run
-inside the isolated worktree, while merge verifies that the main worktree is clean and
-cherry-picks the task branch commits, aborting conflicts. The extension lists the real
-model catalog for the picker, streams `text_delta` events into the Chat page, sends image
-attachments through `run(..., { images })`, and maps supported slash commands to SDK
-methods such as `setModel`, `setReasoningEffort`, `clear`, `compact`, and
-`renameSession`. The terminal agent uses the public `jcode` CLI so it gets the full
-interactive TUI command surface.
+Editable workers use Git worktrees under extension global storage. Diff and commit
+run inside the isolated worktree, while merge verifies that the main worktree is
+clean and cherry-picks the task branch commits, aborting conflicts. The extension
+lists the real model catalog for the picker, streams `agent_message_chunk` text into
+the Chat page, sends image attachments through `session/prompt` content blocks, and
+maps supported slash commands to ACP methods such as `session/set_config_option`,
+`session/prompt` (slash commands), and the `jcode session rename` CLI. The terminal
+agent uses the public `jcode` CLI so it gets the full interactive TUI command
+surface.

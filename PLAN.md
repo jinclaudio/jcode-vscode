@@ -1,5 +1,6 @@
 # jcode VS Code 扩展 · 完整重写计划(v1 审核稿)
 
+> **迁移说明(2026-08-22)**:`jcode api-bridge` 已从 CLI 移除,编辑器集成现改用 `jcode acp`(Agent Client Protocol v1, JSON-RPC over stdio)。所有 `api-bridge` + `@1jehuang/jcode-sdk` 内容已迁移到 `acp-client.js` 的 `AcpClient`(接口向后兼容)。会话列表/历史改读 `~/.jcode/sessions`;`/clear` `/compact` `/rewind` 走 ACP 斜杠命令,`/rename` 走 `jcode session rename` CLI;`softInterrupt` 暂不可用。
 ## 0. 背景:为什么重写
 
 上一版(0.5.x)的根因已定位:**webview 的内联脚本存在语法错误,导致整个脚本从不执行**。
