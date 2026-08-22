@@ -614,10 +614,6 @@ class AcpClient extends EventEmitter {
           });
           break;
         }
-        case "config_option_update": {
-          this._emitModelInfo(sessionId, update.configOptions);
-          break;
-        }
         default:
           break;
       }
